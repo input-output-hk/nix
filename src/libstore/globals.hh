@@ -520,7 +520,7 @@ public:
 
     Setting<Strings> trustedPublicKeys{
         this,
-        {"cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="},
+        {"cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ="},
         "trusted-public-keys",
         R"(
           A whitespace-separated list of public keys. When paths are copied
@@ -609,7 +609,7 @@ public:
 
     Setting<Strings> substituters{
         this,
-        Strings{"https://cache.nixos.org/"},
+        Strings{"https://cache.nixos.org/ https://hydra.iohk.io"},
         "substituters",
         R"(
           A list of URLs of substituters, separated by whitespace. Substituters
