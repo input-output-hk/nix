@@ -12,7 +12,7 @@ using namespace nix;
 struct CmdUpgradeNix : MixDryRun, StoreCommand
 {
     Path profileDir;
-    std::string storePathsUrl = "https://github.com/NixOS/nixpkgs/raw/master/nixos/modules/installer/tools/nix-fallback-paths.nix";
+    std::string storePathsUrl = "https://github.com/input-output-hk/nix/raw/master/nix-fallback-paths.nix";
 
     CmdUpgradeNix()
     {
