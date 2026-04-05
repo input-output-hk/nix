@@ -91,31 +91,23 @@ public:
                 */
                 if (count == 0)
                     continue;
-                if (fds[0].revents & POLLHUP) {
+                // Treat any terminal event on the monitored fd as
+                // disconnection.  POLLERR and POLLNVAL are delivered
+                // regardless of the requested events mask (per POSIX)
+                // and indicate a broken or invalid fd.  If we only
+                // check POLLHUP, a socket in an error state (POLLERR
+                // without POLLHUP) causes a tight 100% CPU spin since
+                // poll() returns immediately on every call.
+                if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
                     unix::triggerInterrupt();
                     break;
                 }
-                if (fds[1].revents & POLLHUP) {
+                // The notifyPipe is used by ~MonitorFdHup to signal
+                // the thread to exit.  Do NOT call triggerInterrupt()
+                // here — this is the normal destruction path.
+                if (fds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) {
                     break;
                 }
-                // On macOS, (jade thinks that) it is possible (although not
-                // observed on macOS 14.5) that in some limited cases on buggy
-                // kernel versions, all the non-POLLHUP events for the socket
-                // get delivered.
-                //
-                // We could sleep to avoid pointlessly spinning a thread on
-                // those, but this opens up a different problem, which is that
-                // if do sleep, it will be longer before the daemon fork for a
-                // client exits. Imagine a sequential shell script, running Nix
-                // commands, each of which talk to the daemon. If the previous
-                // command registered a temp root, exits, and then the next
-                // command issues a delete request before the temp root is
-                // cleaned up, that delete request might fail.
-                //
-                // Not sleeping doesn't actually fix the race condition --- we
-                // would need to block on the old connections' tempt roots being
-                // cleaned up in in the new connection --- but it does make it
-                // much less likely.
             }
         });
     };
