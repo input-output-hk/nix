@@ -23,6 +23,7 @@ deps_private_maybe_subproject = [
   dependency('nix-util'),
   nix_store,
   dependency('nix-expr'),
+  dependency('nix-expr-v3'),
   dependency('nix-flake'),
   dependency('nix-fetchers'),
   dependency('nix-main'),
@@ -182,12 +183,25 @@ endif
 
 include_dirs = [ include_directories('.') ]
 
+# v3 backport: bump main-thread stack on darwin so deep nixpkgs eval
+# doesn't overflow the kernel-default 8 MiB pthread stack.  v3-direct's
+# residual C-recursion (forceValue -> dispatchLoop, callClosure ->
+# dispatchLoop) consumes ~14 KiB per recursive logical force; deep
+# stdenv.mkDerivation chains reach ~5000 vm.frames at peak.  64 MiB
+# provides 8x the default and covers observed workloads.  Mirrors the
+# 2.35 v3 branch (src/nix/meson.build).  Linux/BSD default ulimit is
+# typically higher and process-configurable, so nothing is baked in there.
+nix_link_args = linker_export_flags
+if host_machine.system() == 'darwin'
+  nix_link_args += [ '-Wl,-stack_size,0x4000000' ]  # 64 MiB
+endif
+
 this_exe = executable(
   meson.project_name(),
   sources,
   dependencies : deps_private_subproject + deps_private + deps_other,
   include_directories : include_dirs,
-  link_args : linker_export_flags,
+  link_args : nix_link_args,
   install : true,
   cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
 )

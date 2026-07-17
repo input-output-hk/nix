@@ -1,0 +1,451 @@
+#pragma once
+/// @file
+/// v3-native ParserState — Stage 1.2 of the parser project.
+///
+/// PARSER_PROJECT_PLAN_2026-06-01.md §2 (Stage 1.2).  Port of TW's
+/// `parser-state.hh` (parser-state.hh.upstream) adapted to BUILD THE
+/// v3 AST (include/v3/ast/expr.hh) instead of nix::Expr.
+///
+/// This is the object the parser.y actions call (Stage 1.4): it owns
+/// the AST Pool and provides the semantic helpers the grammar needs —
+/// most importantly `addAttr`, the attrset-merge construction that
+/// turns `{ a.b = 1; a.c = 2; }` into `{ a = { b = 1; c = 2; }; }`
+/// and detects duplicate definitions.
+///
+/// First cut (this commit) ports `addAttr` (+ the leaf insert/merge).
+/// `stripIndentation` (indented strings) and `validateFormals`
+/// (duplicate-arg detection) are queued follow-ups.
+///
+/// Header-only + depends only on the v3 AST header, so it is
+/// unit-testable in isolation (test/ast-addattr-test.cc) — no
+/// bison/flex, no libnixexprv3 link.  The build-wiring (Stage 1.3)
+/// and full action rewrite (Stage 1.4) integrate it afterward.
+///
+/// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
+///   Input Output Group.
+/// SPDX-License-Identifier: Apache-2.0
+
+#include "v3/ast/expr.hh"
+
+#include <algorithm>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace nix::v3::ast {
+
+/// Thrown on a parse-time semantic error (e.g. duplicate attribute).
+/// Carries the file-local position; the parser-error path (Stage 1.4)
+/// formats it into a diagnostic.
+struct ParseError : std::runtime_error {
+    Pos pos;
+    ParseError(std::string msg, Pos pos)
+        : std::runtime_error(std::move(msg)), pos(pos) {}
+};
+
+/// bison location type — byte offsets only (mirrors TW's
+/// ParserLocation, parser-state.hh.upstream:29).  `stash`/`unstash`
+/// support the path-lexer `yyless(0)` rewind (restore the offset of the
+/// pushed-back text).  The file-local offset is the v3 determinism win
+/// vs TW's global PosIdx; the bridge maps it to a PosIdx at eval time.
+struct ParserLoc {
+    uint32_t beginOffset = 0, endOffset = 0;
+    uint32_t stashedBegin = 0, stashedEnd = 0;
+    void stash()   { stashedBegin = beginOffset; stashedEnd = endOffset; }
+    void unstash() { beginOffset = stashedBegin; endOffset = stashedEnd; }
+};
+
+/// IND_STR token payload (mirrors TW's StringToken's hasIndentation
+/// flag).  An indented-string body chunk plus whether it participates
+/// in dedent: the general content rule sets hasIndentation=true; the
+/// escape rules (`''$`, `'''`, `''\x`, lone `'`) set false — they are
+/// mid-line literals with no leading indentation to strip.
+struct IndStr { std::string s; bool hasIndentation = false; };
+
+/// Parser-side formal-argument accumulator (mirrors TW's
+/// FormalsBuilder).  Carries per-formal positions for duplicate
+/// diagnostics; the AST Lambda::Formal (name + def) is built from it
+/// after validation.
+struct FormalsBuilder {
+    struct PFormal { std::string name; Pos pos = noPos; Node * def = nullptr; };
+    std::vector<PFormal> formals;
+    bool ellipsis = false;
+    bool has(const std::string & name) const {
+        for (auto & f : formals) if (f.name == name) return true;
+        return false;
+    }
+};
+
+struct ParserState {
+    Pool pool;
+    /// The parsed top-level expression (set by the grammar's `start`
+    /// production).  Mirrors TW's `ParserState::result`.
+    Node * result = nullptr;
+
+    /// Source-file directory, for resolving RELATIVE path literals
+    /// (`./foo`) — mirrors TW's `state->basePath.path`.  Empty in the
+    /// string-buffer spike (relative paths then store the literal,
+    /// deferred); set by the file-parsing entry (cli/v3-parse) to the
+    /// absolute canonical dirname of the source file.
+    std::string basePath;
+    /// `$HOME` for resolving HOME path literals (`~/foo`) — mirrors TW's
+    /// `getHome()`.  Empty in the spike (home paths store the literal).
+    std::string homePath;
+
+    template <typename T, typename... Args>
+    T * add(Args &&... a) { return pool.add<T>(std::forward<Args>(a)...); }
+
+    /// Application builder (port of parser.y:144 makeCall): if `fn` is
+    /// already a Call, append `arg` to its args (so `f a b` flattens to
+    /// one Call with [a, b]); otherwise make a fresh Call(fn, [arg]).
+    Node * makeCall(Node * fn, Node * arg) {
+        if (fn->kind == Kind::Call) {
+            static_cast<Call *>(fn)->args.push_back(arg);
+            return fn;
+        }
+        return add<Call>(fn, std::vector<Node *>{ arg });
+    }
+
+    // -- formal-argument validation (port of validateFormals) -------
+
+    /// Detect duplicate formal arguments (`{ a, a }: ...`) and a
+    /// collision between the `@`-binding and a formal (`{ a }@a: ...`).
+    /// Mirrors ParserState::validateFormals (parser-state.hh.upstream:300):
+    /// sort by (name, pos), report the lexicographically-min duplicate.
+    /// Throws ParseError on violation.  `argName` empty => no @-binding.
+    void validateFormals(FormalsBuilder & fb, Pos argPos = noPos,
+                         const std::string & argName = "") {
+        std::sort(fb.formals.begin(), fb.formals.end(),
+            [](const FormalsBuilder::PFormal & a, const FormalsBuilder::PFormal & b) {
+                return std::tie(a.name, a.pos) < std::tie(b.name, b.pos);
+            });
+        std::optional<std::pair<std::string, Pos>> dup;
+        for (size_t i = 0; i + 1 < fb.formals.size(); ++i) {
+            if (fb.formals[i].name != fb.formals[i + 1].name) continue;
+            std::pair<std::string, Pos> thisDup{fb.formals[i].name, fb.formals[i + 1].pos};
+            dup = std::min(thisDup, dup.value_or(thisDup));
+        }
+        if (dup)
+            throw ParseError(
+                "duplicate formal function argument '" + dup->first + "'", dup->second);
+        if (!argName.empty() && fb.has(argName))
+            throw ParseError(
+                "duplicate formal function argument '" + argName + "'", argPos);
+    }
+
+    /// Convert a (validated) FormalsBuilder into the AST Lambda's
+    /// `std::vector<Formal>` (name + default).  Per-formal positions are
+    /// only needed for the duplicate diagnostic, so they are dropped
+    /// here; Lambda::show re-sorts lexicographically regardless of order.
+    std::vector<Formal> buildFormals(const FormalsBuilder & fb) {
+        std::vector<Formal> out;
+        out.reserve(fb.formals.size());
+        for (auto & pf : fb.formals) out.push_back(Formal{pf.name, pf.def, pf.pos});
+        return out;
+    }
+
+    // -- paths (port of the path_start productions) ----------------
+
+    /// Minimal CanonPath for ABSOLUTE path literals (parser.y:419).
+    /// Canonicalises `/a/./b//c/..` -> `/a/b`: split on '/', drop empty
+    /// and `.` segments, pop on `..`, rejoin with a leading '/'.  The
+    /// trailing slash is re-added by makePath per the literal
+    /// (parser.y:431).  Empty result is root "/".
+    static std::string canonAbs(std::string_view literal) {
+        std::vector<std::string_view> segs;
+        size_t i = 0;
+        while (i < literal.size()) {
+            while (i < literal.size() && literal[i] == '/') ++i;
+            size_t j = i;
+            while (j < literal.size() && literal[j] != '/') ++j;
+            if (j > i) {
+                std::string_view seg = literal.substr(i, j - i);
+                if (seg == ".") { /* skip */ }
+                else if (seg == "..") { if (!segs.empty()) segs.pop_back(); }
+                else segs.push_back(seg);
+            }
+            i = j;
+        }
+        std::string out;
+        for (auto & s : segs) { out += '/'; out.append(s); }
+        return out.empty() ? std::string("/") : out;
+    }
+
+    /// Build a Path node from a PATH/HPATH literal (port of path_start,
+    /// parser.y:414-462).  ABSOLUTE paths (`/foo`) are canonicalised
+    /// here and are deterministic (no basePath needed).  RELATIVE
+    /// (`./foo`) and HOME (`~/foo`) paths need the source-file basePath
+    /// / $HOME, which the string-buffer spike does NOT have, so their
+    /// RESOLUTION is deferred to integration: the spike stores the
+    /// literal as a placeholder (it lexes + parses, but show() will not
+    /// match TW until basePath is wired).
+    Node * makePath(std::string_view literal, Pos pos) {
+        if (!literal.empty() && literal.front() == '/') {
+            std::string p = canonAbs(literal);
+            if (literal.size() > 1 && literal.back() == '/' && p != "/") p += '/';
+            return add<Path>(std::move(p), pos);
+        }
+        if (!literal.empty() && literal.front() == '~') {
+            // HOME path (parser.y:457): getHome() + literal[1:], NO
+            // canonicalisation (TW concatenates directly).  Deferred to
+            // literal when homePath is unset (the spike).
+            if (homePath.empty()) return add<Path>(std::string(literal), pos);
+            return add<Path>(homePath + std::string(literal.substr(1)), pos);
+        }
+        // RELATIVE path (parser.y:438): CanonPath(literal, basePath).abs().
+        // Deferred to literal when basePath is unset (the spike).
+        if (basePath.empty()) return add<Path>(std::string(literal), pos);
+        std::string p = canonAbs(basePath + "/" + std::string(literal));
+        if (literal.size() > 1 && literal.back() == '/' && p != "/") p += '/';
+        return add<Path>(std::move(p), pos);
+    }
+
+    // -- string / dynamic attr keys --------------------------------
+
+    /// Turn a `string_attr`'s expr into an AttrName.  A plain string
+    /// literal (`"foo"` => a String node) becomes a STATIC symbol key;
+    /// an interpolated string (`"${e}"` => ConcatStrings) or a bare
+    /// `${e}` (any other expr) becomes a DYNAMIC key.  Mirrors parser.y
+    /// attrpath's string_attr visit (nixexpr.cc: static string_view vs
+    /// dynamic Expr*).
+    static AttrName strAttrName(Node * n) {
+        if (n->kind == Kind::String)
+            return AttrName(static_cast<String *>(n)->s);
+        return AttrName(n);
+    }
+
+    // -- attrset construction (port of ParserState::addAttr) --------
+
+    /// The Plain AttrDef named `name` in `attrs`, or null.  (v3 Attrs
+    /// stores a vector, not a map — linear scan; attrsets are small.)
+    static Attrs::AttrDef * findPlain(Attrs * attrs, const std::string & name) {
+        for (auto & d : attrs->attrs)
+            if (d.kind == Attrs::AttrKind::Plain && d.name == name)
+                return &d;
+        return nullptr;
+    }
+
+    /// Dotted path up to (and including) index `upto`, for the
+    /// "attribute 'a.b' already defined" message.  Dynamic keys
+    /// render as `"${...}"` (matches TW's dupAttr path rendering for
+    /// the static cases the precedence/merge battery covers).
+    static std::string dottedPath(const std::vector<AttrName> & path, size_t upto) {
+        std::string s;
+        for (size_t k = 0; k <= upto && k < path.size(); ++k) {
+            if (k) s += '.';
+            s += path[k].expr ? std::string("\"${...}\"") : path[k].symbol;
+        }
+        return s;
+    }
+
+    [[noreturn]] void dupAttr(const std::vector<AttrName> & path, size_t upto, Pos pos) {
+        throw ParseError("attribute '" + dottedPath(path, upto) + "' already defined", pos);
+    }
+
+    // -- inherit (port of the binds1 INHERIT productions) -----------
+
+    /// Any AttrDef (Plain/Inherited/InheritedFrom) named `name`, or null.
+    /// `inherit` collides with ANY prior definition — TW checks the
+    /// symbol map (`$accum->attrs->find`, parser.y:490), which is keyed
+    /// by symbol regardless of kind.
+    static Attrs::AttrDef * findAny(Attrs * attrs, const std::string & name) {
+        for (auto & d : attrs->attrs)
+            if (d.name == name) return &d;
+        return nullptr;
+    }
+
+    /// `inherit name;` — add an Inherited def, dup-checking against any
+    /// prior def (parser.y:487-496).  The name binds to whatever `name`
+    /// resolves to in the surrounding scope (a lowering concern; show()
+    /// only needs the name, so the Inherited AttrDef stores just that).
+    void addInherit(Attrs * attrs, const std::string & name, Pos pos) {
+        if (findAny(attrs, name))
+            throw ParseError("attribute '" + name + "' already defined", pos);
+        attrs->attrs.emplace_back(name);  // Inherited ctor
+        attrs->attrs.back().pos = pos;
+    }
+
+    /// `inherit (e) name;` — add an InheritedFrom def referencing
+    /// `fromIdx` (an index the caller appended into inheritFromExprs).
+    /// Mirrors parser.y:497-512.
+    void addInheritFrom(Attrs * attrs, const std::string & name, int fromIdx, Pos pos) {
+        if (findAny(attrs, name))
+            throw ParseError("attribute '" + name + "' already defined", pos);
+        attrs->attrs.emplace_back(name, fromIdx);  // InheritedFrom ctor
+        attrs->attrs.back().pos = pos;
+    }
+
+    /// Leaf insert-or-merge.  Mirrors the 2-arg `ParserState::addAttr`
+    /// (parser-state.hh.upstream:248): if `symbol` already exists and
+    /// BOTH the existing value and the new value are attrsets, merge
+    /// them recursively; otherwise it's a duplicate-definition error.
+    /// `path`/`leafIdx` are only for the error message.
+    void addAttrLeaf(Attrs * attrs, std::vector<AttrName> & path, size_t leafIdx,
+                     const std::string & symbol, Attrs::AttrDef def, Pos pos) {
+        Attrs::AttrDef * existing = findPlain(attrs, symbol);
+        if (existing) {
+            Attrs * jAttrs = (existing->value && existing->value->kind == Kind::Attrs)
+                ? static_cast<Attrs *>(existing->value) : nullptr;
+            Attrs * ae = (def.value && def.value->kind == Kind::Attrs)
+                ? static_cast<Attrs *>(def.value) : nullptr;
+            if (jAttrs && ae) {
+                // Merge ae's members into jAttrs (recursively for
+                // nested attrsets).  N.B. as upstream notes, any `rec`
+                // marker on `ae` is discarded — a long-standing wart
+                // (NixOS/nix#9020) we reproduce for parity.
+                //
+                // `ae`'s InheritedFrom defs carry a fromIdx into ae's OWN
+                // inheritFromExprs; once ae's exprs are appended to
+                // jAttrs (at offset fromBase), those copied defs must
+                // shift fromIdx by fromBase so each inherited name keeps
+                // pointing at its own source attrset.  Compute fromBase
+                // BEFORE the append.
+                int fromBase = static_cast<int>(jAttrs->inheritFromExprs.size());
+                for (auto & ad : ae->attrs) {
+                    if (ad.kind == Attrs::AttrKind::Plain) {
+                        path.emplace_back(ad.name);
+                        addAttrLeaf(jAttrs, path, path.size() - 1, ad.name, ad, pos);
+                        path.pop_back();
+                    } else if (ad.kind == Attrs::AttrKind::InheritedFrom) {
+                        Attrs::AttrDef nd = ad;
+                        nd.fromIdx = ad.fromIdx + fromBase;
+                        jAttrs->attrs.push_back(nd);
+                    } else {  // Inherited (no source index)
+                        jAttrs->attrs.push_back(ad);
+                    }
+                }
+                for (auto & d : ae->dynamicAttrs)
+                    jAttrs->dynamicAttrs.push_back(d);
+                for (auto & f : ae->inheritFromExprs)
+                    jAttrs->inheritFromExprs.push_back(f);
+                ae->attrs.clear();
+                ae->dynamicAttrs.clear();
+                ae->inheritFromExprs.clear();
+            } else {
+                dupAttr(path, leafIdx, pos);
+            }
+        } else {
+            attrs->attrs.push_back(std::move(def));
+        }
+    }
+
+    // -- indented strings (port of stripIndentation) ---------------
+
+    /// One segment of an indented-string body.  Either a (lexer-
+    /// unescaped) string chunk that participates in dedent
+    /// (`hasIndentation`), or an antiquotation `${expr}` (opaque to
+    /// dedent — it ends start-of-line whitespace).
+    struct IndStringSegment {
+        bool   isString;
+        std::string str;        // valid when isString
+        bool   hasIndentation;  // only when isString
+        Node * expr = nullptr;  // valid when !isString
+    };
+
+    /// Strip the common leading indentation from an indented string,
+    /// matching `ParserState::stripIndentation`
+    /// (parser-state.hh.upstream:324).  Two passes: find the minimum
+    /// indent (whitespace-only final/empty lines excluded), then drop
+    /// that many leading spaces per line; the trailing whitespace-only
+    /// line of the last string segment is removed.  Returns a String
+    /// (single chunk) or ConcatStrings (interpolated).
+    Node * stripIndentation(const std::vector<IndStringSegment> & es, Pos pos) {
+        if (es.empty()) return add<String>(std::string(""), pos);
+
+        // Pass 1: minimum indentation.
+        bool atStartOfLine = true;
+        size_t minIndent = 1000000, curIndent = 0;
+        for (auto & seg : es) {
+            if (!seg.isString || !seg.hasIndentation) {
+                if (atStartOfLine) { atStartOfLine = false; minIndent = std::min(minIndent, curIndent); }
+                continue;
+            }
+            for (char c : seg.str) {
+                if (atStartOfLine) {
+                    if (c == ' ') curIndent++;
+                    else if (c == '\n') curIndent = 0;          // empty line
+                    else { atStartOfLine = false; minIndent = std::min(minIndent, curIndent); }
+                } else if (c == '\n') { atStartOfLine = true; curIndent = 0; }
+            }
+        }
+
+        // Pass 2: strip.
+        std::vector<Node *> es2;
+        atStartOfLine = true;
+        size_t curDropped = 0;
+        size_t remaining = es.size();
+        for (auto & seg : es) {
+            if (!seg.isString) {            // antiquotation
+                atStartOfLine = false; curDropped = 0;
+                es2.push_back(seg.expr);
+            } else {
+                std::string s2;
+                for (char c : seg.str) {
+                    if (atStartOfLine) {
+                        if (c == ' ') { if (curDropped++ >= minIndent) s2 += c; }
+                        else if (c == '\n') { curDropped = 0; s2 += c; }
+                        else { atStartOfLine = false; curDropped = 0; s2 += c; }
+                    } else {
+                        s2 += c;
+                        if (c == '\n') atStartOfLine = true;
+                    }
+                }
+                // Remove a trailing whitespace-only last line (only on
+                // the last segment — `remaining == 1`).
+                if (remaining == 1) {
+                    auto p = s2.find_last_of('\n');
+                    if (p != std::string::npos && s2.find_first_not_of(' ', p + 1) == std::string::npos)
+                        s2 = s2.substr(0, p + 1);
+                }
+                if (!s2.empty()) es2.push_back(add<String>(std::move(s2), pos));
+            }
+            --remaining;
+        }
+
+        if (es2.empty()) return add<String>(std::string(""), pos);
+        if (es2.size() == 1 && es2[0]->kind == Kind::String) return es2[0];
+        // forceString=true (parser-state.hh.upstream:428): an indented
+        // string coerces interpolated parts to strings, like `"…"`.
+        return add<ConcatStrings>(std::move(es2), /*forceString=*/true, pos);
+    }
+
+    /// Full attrpath insert.  Mirrors the 5-arg `ParserState::addAttr`
+    /// (parser-state.hh.upstream:195): walk the non-leaf path elements
+    /// creating/descending nested attrsets, then insert the leaf.
+    /// `path` must be non-empty.
+    void addAttr(Attrs * attrs, std::vector<AttrName> path, Node * e, Pos pos) {
+        // Walk non-leaf elements (all but the last).
+        for (size_t i = 0; i + 1 < path.size(); ++i) {
+            Attrs * nested;
+            if (!path[i].expr) {                 // static symbol
+                Attrs::AttrDef * j = findPlain(attrs, path[i].symbol);
+                if (j) {
+                    nested = (j->value && j->value->kind == Kind::Attrs)
+                        ? static_cast<Attrs *>(j->value) : nullptr;
+                    if (!nested) dupAttr(path, i, pos);
+                } else {
+                    nested = add<Attrs>(false);
+                    attrs->attrs.emplace_back(path[i].symbol, static_cast<Node *>(nested));
+                }
+            } else {                             // dynamic ${expr}
+                nested = add<Attrs>(false);
+                attrs->dynamicAttrs.push_back({path[i].expr, static_cast<Node *>(nested)});
+            }
+            attrs = nested;
+        }
+        // Insert the leaf.
+        size_t leaf = path.size() - 1;
+        if (!path[leaf].expr) {
+            Attrs::AttrDef leafDef(path[leaf].symbol, e);
+            leafDef.pos = pos;   // byte offset of the attr name (unsafeGetAttrPos)
+            addAttrLeaf(attrs, path, leaf, path[leaf].symbol,
+                        std::move(leafDef), pos);
+        } else {
+            attrs->dynamicAttrs.push_back({path[leaf].expr, e});
+        }
+    }
+};
+
+} // namespace nix::v3::ast

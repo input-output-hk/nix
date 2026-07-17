@@ -1,0 +1,20 @@
+# Baseline for lint-no-direct-tw-include.sh — the SHRINKING set of genuine
+# v3-LIBRARY files that still carry a direct `#include "nix/...` and are
+# slated to migrate behind include/v3/ffi.hh (FFI_CONSOLIDATION_AUDIT_
+# 2026-06-01 Phase 2/3/4).  EMPTY at the audit's end state.
+#
+# Permanent FFI leaves / tooling / translation boundary (ffi.{hh,cc},
+# disk_cache.cc, parser/, test/, lower_v3.hh, tw_baseenv.hh, gc-config.hh)
+# are NOT listed here — they are path-pattern EXEMPT in the lint itself
+# (audit §5.1, §8).
+#
+# The lint FAILS if a file that is neither EXEMPT nor listed here gains a
+# TW include (V3-NATIVE regression).  As a target migrates behind ffi.hh
+# and drops all TW includes, REMOVE it from this list — the ratchet
+# tightens; re-introduction then fails the lint.
+#
+# Generated 2026-06-02 (post-parser; post gc-config consolidation).
+# Lines starting with '#' and blank lines are ignored.
+
+# --- Category C/D pinch: eval.hh / value.hh / shared types (Phase 2/3) ---
+primops.cc

@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# #457/#458 — gate-removal regression tests.
+#
+# As we systematically lift the gates that decline v3 ownership
+# (`stay in the v3 VM as much as possible`), each gate flip needs
+# accompanying positive/negative/regression cases to pin the new
+# behaviour and catch any future re-decline.
+#
+# Tests:
+#   T1 (formals gate): formals lambdas now run through v3 by default.
+#       Positive: NixOS-module-shape lambdas evaluate identically
+#                 to TW.
+#       Negative: NIX_V3_NO_CALL_FORMALS=1 declines formals (legacy
+#                 path); result still parity.
+#       Regression: arg-laziness preserved (per-attr Bridge thunk
+#                   matches TW's per-formal lazy semantics).
+#
+# Future tests appended as we lift more gates.
+#
+# Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
+# SPDX-License-Identifier: Apache-2.0
+
+set -u
+
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+NIX_BIN="${NIX_BIN:-$ROOT/build/src/nix/nix}"
+
+if [[ ! -x "$NIX_BIN" ]]; then
+  echo "nix not found at $NIX_BIN" >&2
+  exit 1
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+# T1.p1 — basic formals lambda
+cat > "$TMP/t1p1.nix" <<'EOF'
+let f = { a, b ? 10 }: a + b; in f { a = 5; }
+EOF
+EXP_T1P1='15'
+
+# T1.p2 — formals + ellipsis (NixOS-module shape)
+cat > "$TMP/t1p2.nix" <<'EOF'
+let f = { config, options ? {}, ... }@args: config.x or 0;
+in f { config = { x = 42; }; }
+EOF
+EXP_T1P2='42'
+
+# T1.p3 — formals lambda + arg laziness: v3 must NOT force unused entries.
+cat > "$TMP/t1p3.nix" <<'EOF'
+let f = { a, b ? 0 }: a;
+in f { a = 99; b = throw "should not force"; }
+EOF
+EXP_T1P3='99'
+
+# T1.p4 — formals + recursion (the `lib: self: super:` shape from cardano-node).
+cat > "$TMP/t1p4.nix" <<'EOF'
+let
+  fix = f: let x = f x; in x;
+  buildLayer = { lib, self, super }: { result = self.base + super.add; };
+  toFix = self: { base = 10; result = (buildLayer { inherit lib self super; }).result; };
+  lib = { id = x: x; };
+  super = { add = 5; };
+in (fix toFix).result
+EOF
+EXP_T1P4='15'
+
+# T1.n1 — same as p1 but with NIX_V3_NO_CALL_FORMALS=1 (legacy path).
+#         Should still produce identical result.
+
+# T2 — re-entrancy depth lift: nested v3 call-hook entries now allowed
+#       up to NIX_V3_CALL_DEPTH_LIMIT=8 by default (was 0).
+# T2.p1 — recursion (nested v3 hook fires)
+cat > "$TMP/t2p1.nix" <<'EOF'
+let
+  fact = n: if n <= 1 then 1 else n * fact (n - 1);
+in fact 6
+EOF
+EXP_T2P1='720'
+
+# T2.p2 — mutual recursion
+cat > "$TMP/t2p2.nix" <<'EOF'
+let
+  even = n: if n == 0 then true else odd (n - 1);
+  odd = n: if n == 0 then false else even (n - 1);
+in [(even 10) (odd 10)]
+EOF
+EXP_T2P2='[ true false ]'
+
+# T2.n1 — depth=0 (legacy refuse-nested) still produces correct results.
+
+# T4 — sizeHeuristicSkip lift.  Was 50 functions; now SIZE_MAX (no cap).
+# T4.p1 — synthetic large module with many lambdas.  v3 should now own it.
+cat > "$TMP/t4p1.nix" <<'EOF'
+let
+  mkLambda = n: x: x + n;
+  l1 = mkLambda 1; l2 = mkLambda 2; l3 = mkLambda 3; l4 = mkLambda 4;
+  l5 = mkLambda 5; l6 = mkLambda 6; l7 = mkLambda 7; l8 = mkLambda 8;
+  l9 = mkLambda 9; l10 = mkLambda 10; l11 = mkLambda 11; l12 = mkLambda 12;
+  l13 = mkLambda 13; l14 = mkLambda 14; l15 = mkLambda 15; l16 = mkLambda 16;
+  l17 = mkLambda 17; l18 = mkLambda 18; l19 = mkLambda 19; l20 = mkLambda 20;
+  fns = [l1 l2 l3 l4 l5 l6 l7 l8 l9 l10 l11 l12 l13 l14 l15 l16 l17 l18 l19 l20];
+in builtins.foldl' (acc: f: acc + (f 100)) 0 fns
+EOF
+EXP_T4P1='2210'
+
+# T4.n1 — restore legacy threshold via NIX_V3_SKIP_THRESHOLD=50 should
+#         work identically (correctness; just declines compilation
+#         and falls back to TW).
+
+ok=0
+fail=0
+fail_names=()
+
+run_one() {
+  local label="$1"; shift
+  local nix_file="$1"; shift
+  local expected="$1"; shift
+  local extra_env=("$@")
+
+  local got
+  got=$(env "${extra_env[@]}" "$NIX_BIN" eval --no-eval-cache -f "$nix_file" 2>/dev/null) \
+    || got="<error>"
+  if [[ "$got" == "$expected" ]]; then
+    ok=$((ok + 1))
+  else
+    fail=$((fail + 1))
+    fail_names+=("$label  expected=$expected  got=$got")
+  fi
+}
+
+# Modes:
+#   tw:        TW baseline.
+#   v3:        v3 default (formals now ON by default).
+#   v3-noform: NIX_V3_NO_CALL_FORMALS=1 (legacy refuse-formals path).
+modes=(
+  "tw::"
+  "v3::NIX_USE_V3=1"
+  "v3-noform::NIX_USE_V3=1 NIX_V3_NO_CALL_FORMALS=1"
+  "v3-depth0::NIX_USE_V3=1 NIX_V3_CALL_DEPTH_LIMIT=0"
+  "v3-thresh50::NIX_USE_V3=1 NIX_V3_SKIP_THRESHOLD=50"
+)
+
+for spec in "${modes[@]}"; do
+  IFS=:: read -r tag _ envspec <<< "$spec"
+  IFS=' ' read -ra envarr <<< "$envspec"
+  run_one "$tag/T1p1" "$TMP/t1p1.nix" "$EXP_T1P1" "${envarr[@]}"
+  run_one "$tag/T1p2" "$TMP/t1p2.nix" "$EXP_T1P2" "${envarr[@]}"
+  run_one "$tag/T1p3" "$TMP/t1p3.nix" "$EXP_T1P3" "${envarr[@]}"
+  run_one "$tag/T1p4" "$TMP/t1p4.nix" "$EXP_T1P4" "${envarr[@]}"
+  run_one "$tag/T2p1" "$TMP/t2p1.nix" "$EXP_T2P1" "${envarr[@]}"
+  run_one "$tag/T2p2" "$TMP/t2p2.nix" "$EXP_T2P2" "${envarr[@]}"
+  run_one "$tag/T4p1" "$TMP/t4p1.nix" "$EXP_T4P1" "${envarr[@]}"
+done
+
+echo "=== gate-removal tests: ok=$ok fail=$fail (total=$((ok+fail))) ==="
+for n in "${fail_names[@]}"; do
+  echo "  FAIL $n"
+done
+[[ $fail -eq 0 ]] || exit 1

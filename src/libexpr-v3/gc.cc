@@ -1,0 +1,1894 @@
+// Cheney scavenge implementation for the v3 nursery.  Background and
+// design: `lode/CHENEY_NURSERY_DESIGN.md`.  Phase C entry point.
+//
+// Strategy
+// --------
+// Side-table forwarding (`unordered_map<oldPtr, newPtr>`) — chosen
+// over header bit-stealing for the first version because it doesn't
+// require layout changes to `Thunk` / `Closure` / `ListVec`.  The
+// per-scavenge map is rebuilt from empty each time, so the cost is
+// proportional to the live nursery size, not the historic alloc
+// count.
+//
+// Worklist drain — `forwardClosure` / `forwardThunk` / `forwardList`
+// COPY the live nursery object to tenured, record (old, new) in the
+// forward map, and queue the new tenured pointer in a graylist;
+// they do NOT recurse into the children's pointers.  A single
+// `drain()` loop walks the graylist iteratively, mutating each
+// queued object's children in place.  This keeps the C-stack flat
+// regardless of graph depth.
+//
+// Tenured walk — for tenured `Closure` / `Thunk` / `ListVec` /
+// `Bindings` / `ValuePair` we encounter while walking, we ALSO
+// queue them (gated by a `walked` set) so any tenured-to-nursery
+// references they hold get rewritten.  In Phase C v1 we lack a
+// remembered-set / write-barrier, so this is the conservative way
+// to find every live nursery pointer.  Phase D will replace this
+// with cell tracking + a write barrier so we don't re-scan all
+// reached tenured objects per scavenge.
+//
+// Bindings / ValuePair stay tenured by design.  If a Bindings or
+// ValuePair pointer is observed to be inside the nursery here
+// (which would mean an allocator bug), `std::abort` fires — moving
+// either type would invalidate `Tag::Slot` / `Thunk::cell`
+// pointers that may exist anywhere in the live graph.
+//
+// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
+// Input Output Group.
+// SPDX-License-Identifier: Apache-2.0
+
+#include "v3/gc.hh"
+#include "v3/nursery.hh"
+#include "v3/alloc.hh"
+#include "v3/bytecode.hh"  // #705: AttrSelectIC roots
+#include "v3/closure.hh"
+#include "v3/primop.hh"  // #705: walkV3BridgeRoots
+#include "v3/bytecode_primops.hh"  // #705: walkBytecodePrimopRoots, walkBuiltinsRoot
+#include "v3/print.hh"  // Round 1 #7: walkDeepForceRoots
+#include "v3/barrier.hh"  // Phase D: dirty-list + standalone cells
+#include "v3/value.hh"
+#include "v3/vm.hh"
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace nix::v3 {
+
+namespace {
+
+enum GrayKind : uint8_t {
+    GK_CLOSURE  = 0,
+    GK_THUNK    = 1,
+    GK_LIST     = 2,
+    GK_BINDINGS = 3,
+    GK_PAIR     = 4,
+    GK_ENV      = 5,  ///< env-sharing: a shared upvalue Env (tenured, non-moving)
+};
+
+struct Gray { void * ptr; uint8_t kind; };
+
+/// Persistent per-thread scratch buffers.  Reused across scavenge
+/// calls (cleared at the start of each one, capacity retained).
+/// Cuts per-scavenge malloc/free traffic from O(reachable) buckets +
+/// O(reachable) hashes per pass to amortised zero — the buffers grow
+/// to the high-water-mark of the eval and stay there.  Material
+/// under aggressive scavenge (small nursery, frequent reclaims).
+struct ScavengeBuffers
+{
+    std::unordered_map<void *, void *> forward;
+    std::unordered_set<void *>         walked;
+    std::vector<Gray>                  graylist;
+
+    void clear()
+    {
+        forward.clear();
+        walked.clear();
+        graylist.clear();
+    }
+};
+
+ScavengeBuffers & threadScavengeBuffers() noexcept
+{
+    thread_local ScavengeBuffers b;
+    return b;
+}
+
+/// Per-scavenge state — references into the thread-local
+/// `ScavengeBuffers` above so we don't allocate fresh containers
+/// on every call.  Lifetime is bounded by `scavengeNursery`.
+// Phase D Step 7 gate — process-wide.  When ACTIVE, scavenger's
+// fwd*() helpers SKIP queueing originally-tenured pointers for the
+// transitive walk.  Newly-forwarded copies (nursery → tenured) still
+// get queued so their fields' nursery pointers can be located and
+// forwarded.
+//
+// Correctness invariant: every tenured-to-nursery write MUST go
+// through a barrier helper (`v3/barrier.hh`) so the inter-gen edge
+// lands in `dirtyContainers`.  The scavenger walks the dirty list
+// AFTER natural roots; that catches any tenured container with a
+// nursery edge that the original Phase C transitive walk would have
+// found.
+//
+// 2026-05-21: promoted to DEFAULT-ON after `NIX_V3_PHASE_D=1` +
+// STRESS=1000 validation showed 15/15 PASS across synthetic +
+// nixpkgs workloads through firefox.name (see commit 780e419bf for
+// the milestone).  Opt out via `NIX_V3_NO_PHASE_D=1` if Phase C's
+// blanket walk is preferred for diagnostic comparison or in case a
+// regression appears.
+//
+// Note: this only matters when `NIX_V3_NURSERY=1` (without nursery
+// routing, scavenge never fires).  Production default
+// `NIX_V3_NURSERY=0` keeps Phase D inert.
+//
+// Cached once on first scavenge.  Cheap branch in fwd*() under
+// `__builtin_expect(gate, 1)` so ON mode is the predicted path.
+inline bool phaseDStep7Active() noexcept
+{
+    static const bool s_active = [] {
+        // S2.1 (#174): when mid-eval EVACUATION is enabled, the scavenge must NOT
+        // trust the dirty list.  evac's raw-copy relocation + any un-barrier'd
+        // raw/bulk write can leave a tenured→nursery edge out of the remembered
+        // set, and a MOVING collector cannot tolerate a missed root.  Disabling
+        // Step 7 makes the scavenge fully WALK root-reached tenured cells (the
+        // phaseE behaviour), forwarding EVERY tenured→nursery edge regardless of
+        // barrier completeness — correct by construction, at the cost of extra
+        // scavenge work, paid only under the opt-in NIX_V3_EVAC.  This sidesteps
+        // localizing the specific un-barrier'd write site (lode/SAFEPOINT_
+        // FOUNDATION_S2.1_RCA_2026-06-25.md) with a sound conservative walk.
+        if (std::getenv("NIX_V3_EVAC") != nullptr) return false;
+        const char * v = std::getenv("NIX_V3_NO_PHASE_D");
+        // Default ON unless explicitly opted out via
+        // NIX_V3_NO_PHASE_D=1.
+        return v == nullptr || v[0] == '\0' || v[0] == '0';
+    }();
+    return s_active;
+}
+
+// PhD-6 (2026-06-14): a walked tenured object's [lo,hi) range + its CellType,
+// so the BRUTE scanner can TYPE the holder of a missed-root word (and compute
+// the field offset = hitAddr - lo).  Carries the type the walk* method already
+// knows; zero extra work beyond the byte the vector already had latent padding for.
+struct ScavLiveRange { uintptr_t lo; uintptr_t hi; uint8_t type; };
+
+struct Scavenger
+{
+    Nursery & n;
+    VMState & vm;
+    /// nursery oldPtr -> tenured newPtr (lookup before copy)
+    std::unordered_map<void *, void *> & forward;
+    /// objects already queued for walk (deduplication for both
+    /// freshly-copied tenured AND originally-tenured paths)
+    std::unordered_set<void *> & walked;
+    /// queued objects to walk in `drain()`
+    std::vector<Gray> & graylist;
+    /// #705 (2026-05-21): CUs whose attrSelectCache has been
+    /// walked.  Populated from every walkClosure / walkThunk so any
+    /// CU transitively reachable from a root is covered.
+    std::unordered_set<const CompilationUnit *> walkedCUs;
+    /// 2026-05-21 (Phase 1.7 R1 refinement): [start, end) byte
+    /// ranges of every TENURED object walked this scavenge.  Used
+    /// by `postScavengeBruteScan` to filter "false positive" hits
+    /// in dead-but-arena-resident objects (Boehm conservatively
+    /// pins the whole arena as a root, so dead tenured Closures /
+    /// Bindings keep their nursery pointers in memory).  An hit
+    /// outside any range here is dead memory and harmless;
+    /// only hits INSIDE one of these ranges indicate a true
+    /// missed-root bug (reachable tenured pointer not forwarded).
+    ///
+    /// Populated by each walk* method on entry (when the object
+    /// originated in tenured arena — nursery copies have already
+    /// been replaced by their tenured forward at this point).
+    /// Sorted-and-searched after drain() completes.
+    std::vector<ScavLiveRange> liveTenuredRanges;  // PhD-6: now typed
+    /// #738 Phase E v0.1: bytes copied from nursery -> tenured this
+    /// scavenge.  Summed by each fwd* function on a successful copy.
+    /// Used by run() to call `Nursery::recordSurvival` at the end
+    /// so process-lifetime survivedBytes/diedBytes stats can be
+    /// reported by run.cc's NIX_VM_STATS path.
+    uint64_t bytesSurvived = 0;
+    /// #738 Phase E v0.2 per-scavenge breakdown.  bytesSurvived is
+    /// the union (Y→S + S→T + Y→T-overflow) for legacy comparison;
+    /// these three split the destination so the Phase E banner can
+    /// show what % was age-1 promotion (Y→S) vs age-2 tenuring (S→T)
+    /// vs survivor-overflow (Y→T direct).  Phase E disabled: only
+    /// bytesYToTOvf bumps (legacy single-region behaviour, mapped
+    /// onto the overflow counter for uniform output).
+    uint64_t bytesPhaseEYToS    = 0;
+    uint64_t bytesPhaseESToT    = 0;
+    uint64_t bytesPhaseEYToTOvf = 0;
+    /// #738 Phase E v0.2: containers walked by `walk*` whose copy
+    /// landed in TENURED (either originally-tenured + dirty-list
+    /// entry, or active-S object promoted by this scavenge).  After
+    /// drain, the scavenger re-inspects each via the matching
+    /// post-construct barrier so any tenured→survivor edges the
+    /// scavenger itself created get tracked in dirtyContainers for
+    /// the next cycle.  Stored as (kind, ptr) pairs mirroring
+    /// DirtyEntry semantics.
+    std::vector<std::pair<int, void *>> tenuredWalkedForRebarrier;
+    /// Record a tenured [start, end) byte range for the BRUTE
+    /// reachability filter.  Called by walk* methods.  No-op if
+    /// the pointer is in the nursery (means a nursery copy that
+    /// hasn't been forwarded yet — caller bug, but BRUTE doesn't
+    /// care about nursery bytes either way).
+    void recordLiveTenured(const void * p, size_t bytes,
+                           CellType type = CellType::None)
+    {
+        if (!p || n.contains(p)) return;
+        const uintptr_t lo = reinterpret_cast<uintptr_t>(p);
+        liveTenuredRanges.push_back(
+            {lo, lo + bytes, static_cast<uint8_t>(type)});
+    }
+
+    // -- pointer forwarders (no recursion; just copy + queue) ----
+
+    Closure  * fwdClosure (Closure  * c);
+    Thunk    * fwdThunk   (Thunk    * t);
+    ListVec  * fwdList    (ListVec  * l);
+    Bindings * fwdBindings(Bindings * b);
+    ValuePair * fwdPair   (ValuePair * p);
+
+    // -- value visitor: dispatches to the right forwarder --------
+
+    void visitValue(Value & v);
+
+    // -- per-type field walkers (called from drain) --------------
+
+    void walkClosure (Closure  * c);
+    void walkThunk   (Thunk    * t);
+    void walkList    (ListVec  * l);
+    void walkBindings(Bindings * b);
+    void walkPair    (ValuePair * p);
+    void walkEnv     (Env      * e);  ///< env-sharing: walk a shared upvalue Env
+
+    // -- top-level driver ---------------------------------------
+
+    void drain();
+    void run();
+};
+
+Closure * Scavenger::fwdClosure(Closure * c)
+{
+    if (!c) return nullptr;
+    // #738 Phase E v0.2: split-region dispatch.  When Phase E is
+    // active, Y survivors go to the inactive survivor buffer (age 1
+    // promotion) and active-S survivors go to tenured (age 2 =
+    // tenured).  When Phase E is disabled, every nursery survivor
+    // goes to tenured (legacy Phase D behaviour).
+    if (n.isPhaseEActive()) {
+        if (n.inYoung(c)) {
+            auto it = forward.find(c);
+            if (it != forward.end()) return static_cast<Closure *>(it->second);
+            const size_t bytes = closureAllocatedSize(c);
+            void * dst = n.targetSurvivorAlloc(bytes);
+            const bool toSurv = (dst != nullptr);
+            if (!dst) dst = threadArena().alloc(bytes, CellType::Closure);  // S overflow → T (B0.1: stamp type)
+            std::memcpy(dst, c, bytes);
+            forward.emplace(c, dst);
+            graylist.push_back({dst, GK_CLOSURE});
+            bytesSurvived += bytes;
+            if (toSurv) bytesPhaseEYToS    += bytes;
+            else        bytesPhaseEYToTOvf += bytes;
+            return static_cast<Closure *>(dst);
+        }
+        if (n.inActiveSurvivor(c)) {
+            auto it = forward.find(c);
+            if (it != forward.end()) return static_cast<Closure *>(it->second);
+            const size_t bytes = closureAllocatedSize(c);
+            void * dst = threadArena().alloc(bytes, CellType::Closure);  // B0.1: stamp type
+            std::memcpy(dst, c, bytes);
+            forward.emplace(c, dst);
+            graylist.push_back({dst, GK_CLOSURE});
+            bytesSurvived += bytes;
+            bytesPhaseESToT += bytes;
+            return static_cast<Closure *>(dst);
+        }
+        // Fall through to tenured path.
+    } else if (n.contains(c)) {
+        // Legacy Phase D single-region path: every survivor → tenured.
+        auto it = forward.find(c);
+        if (it != forward.end()) return static_cast<Closure *>(it->second);
+        const size_t bytes = closureAllocatedSize(c);
+        void * dst = threadArena().alloc(bytes, CellType::Closure);  // B0.1: stamp type
+        std::memcpy(dst, c, bytes);
+        forward.emplace(c, dst);
+        graylist.push_back({dst, GK_CLOSURE});
+        bytesSurvived       += bytes;
+        bytesPhaseEYToTOvf  += bytes;  // map legacy onto overflow slot for uniform stats
+        return static_cast<Closure *>(dst);
+    }
+    // #738 Phase E v0.2 — under Phase E, force tenured-Closure walk
+    // (same rationale as fwdBindings): the scavenger may update
+    // upvalue[] entries to point into the active-S buffer, and
+    // Phase D Step 7's dirty-list-only path doesn't account for
+    // edges created BY the scavenger itself.
+    if (n.isPhaseEActive()) {
+        if (walked.insert(c).second) graylist.push_back({c, GK_CLOSURE});
+        return c;
+    }
+    // Originally-tenured: under Phase D Step 7 gate, skip the
+    // transitive walk — the dirty-list mechanism (barriers in
+    // v3/barrier.hh) guarantees any nursery edge in this Closure
+    // is recorded in dirtyContainers and walked separately.
+    if (__builtin_expect(phaseDStep7Active(), 1)) return c;
+    if (walked.insert(c).second) graylist.push_back({c, GK_CLOSURE});
+    return c;
+}
+
+/// True iff `tg` denotes a Value whose `payload` carries no v3-heap
+/// pointer that the walker would need to forward.  Used as a fast-
+/// path predicate by `fwdThunk` (and analogous walks) to skip queuing
+/// already-WHNF Thunks whose evaluated payload is a leaf scalar.
+[[gnu::always_inline]] static inline bool isLeafTag(Tag tg) noexcept
+{
+    switch (tg) {
+    case Tag::Int:
+    case Tag::Float:
+    case Tag::Bool:
+    case Tag::Null:
+    case Tag::String:
+    case Tag::Path:
+    case Tag::PrimOp:
+    case Tag::Blackhole:
+    case Tag::External:
+    case Tag::Uninitialized:
+        return true;
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::Attrs:
+    case Tag::List:
+    case Tag::App:
+    case Tag::App3:
+    case Tag::PrimOpApp:
+    case Tag::Slot:
+        return false;
+    }
+    return false;
+}
+
+Thunk * Scavenger::fwdThunk(Thunk * t)
+{
+    if (!t) return nullptr;
+    // #738 Phase E v0.2: branch on region same as fwdClosure.
+    // Layout-dependent byte calculation matches the legacy single-
+    // region copy path.
+    // FP-2b: single source of truth (includes the optional withs tail slot for
+    // Suspended/Blackhole) — this is the EVAC COPY size; under-counting here
+    // would drop the slot on relocation = UAF.
+    auto computeThunkBytes = [](Thunk * tk) -> size_t { return thunkScanSize(tk); };
+    if (n.isPhaseEActive()) {
+        if (n.inYoung(t)) {
+            auto it = forward.find(t);
+            if (it != forward.end()) return static_cast<Thunk *>(it->second);
+            const size_t bytes = computeThunkBytes(t);
+            void * dst = n.targetSurvivorAlloc(bytes);
+            const bool toSurv = (dst != nullptr);
+            if (!dst) dst = threadArena().alloc(bytes, CellType::Thunk);  // B0.1: stamp type
+            std::memcpy(dst, t, bytes);
+            forward.emplace(t, dst);
+            graylist.push_back({dst, GK_THUNK});
+            bytesSurvived += bytes;
+            if (toSurv) bytesPhaseEYToS    += bytes;
+            else        bytesPhaseEYToTOvf += bytes;
+            return static_cast<Thunk *>(dst);
+        }
+        if (n.inActiveSurvivor(t)) {
+            auto it = forward.find(t);
+            if (it != forward.end()) return static_cast<Thunk *>(it->second);
+            const size_t bytes = computeThunkBytes(t);
+            void * dst = threadArena().alloc(bytes, CellType::Thunk);  // B0.1: stamp type
+            std::memcpy(dst, t, bytes);
+            forward.emplace(t, dst);
+            graylist.push_back({dst, GK_THUNK});
+            bytesSurvived += bytes;
+            bytesPhaseESToT += bytes;
+            return static_cast<Thunk *>(dst);
+        }
+        // Fall through to tenured path.
+    } else if (n.contains(t)) {
+        // Legacy Phase D path.
+        auto it = forward.find(t);
+        if (it != forward.end()) return static_cast<Thunk *>(it->second);
+        // #705 / N1 (2026-05-21): Blackhole MUST copy the full
+        // Suspended-layout (header + tail[nUpvalues]).  The union
+        // variant remains `suspended` while the body is executing,
+        // and `clearBlackMarksOnException` can revert Blackhole →
+        // Suspended on exception unwind — at which point OP_FORCE
+        // re-reads `tail[i]` and `suspended.capturedWiths` to
+        // rebuild the fakeClo.
+        const size_t bytes = computeThunkBytes(t);
+        void * dst = threadArena().alloc(bytes, CellType::Thunk);  // B0.1: stamp type
+        std::memcpy(dst, t, bytes);
+        forward.emplace(t, dst);
+        graylist.push_back({dst, GK_THUNK});
+        bytesSurvived       += bytes;
+        bytesPhaseEYToTOvf  += bytes;
+        return static_cast<Thunk *>(dst);
+    }
+    // #738 Phase E v0.2 force-walk tenured Thunk — see fwdBindings.
+    if (n.isPhaseEActive()) {
+        // Skip leaf-tag Bridge/Evaluated as in the optimized path —
+        // those carry no v3-heap pointer to walk.  Suspended/Native/
+        // Blackhole DO carry pointers; walk them under Phase E.
+        switch (t->state) {
+        case ThunkState::Evaluated:
+            if (isLeafTag(t->evaluated.tag()) && !t->cell) return t;
+            break;
+        case ThunkState::Suspended:
+        case ThunkState::Native:
+        case ThunkState::Blackhole:
+            break;
+        }
+        if (walked.insert(t).second) graylist.push_back({t, GK_THUNK});
+        return t;
+    }
+    // Tenured Thunk fast paths — skip queuing entirely when the
+    // thunk has no v3-heap payload to walk.  Material on workloads
+    // that build many tenured thunks then evaluate them to leaf
+    // scalars (e.g. genList of integers force-iterated by foldl'):
+    // pre-fix, every such thunk was hashed into `walked` and
+    // queued + walked + dispatched-on-state, even though its only
+    // ref-bearing fields contained Tag::Int.  Hash insert + queue +
+    // drain dominated the per-scavenge cost.
+    //
+    // Bridge: bridgeSrc is a `nix::Value *` (TW heap), never v3
+    // nursery — no work for that field.  BUT a Bridge thunk MAY
+    // carry a `cell` (`STG-14b option (a)` cell-update protocol;
+    // see vm.cc Bridge handler comment) whose contents may hold a
+    // nursery payload.  #705 (2026-05-20): if the cell is set,
+    // queue the thunk so walkThunk walks the cell.
+    //
+    // Blackhole: state's payload is irrelevant (body mid-exec),
+    // but the cell is preserved across blackhole → evaluated
+    // (CFF_THUNK_RETURN propagates), so the same caveat applies.
+    //
+    // Evaluated with leaf tag: `evaluated` payload has no
+    // forwardable pointer.  Cell included in the gate.
+    switch (t->state) {
+    case ThunkState::Blackhole:
+        if (!t->cell) return t;  // truly nothing to walk
+        break;                   // fall through to queue if cell set
+    case ThunkState::Evaluated:
+        if (isLeafTag(t->evaluated.tag()) && !t->cell) return t;
+        break;
+    case ThunkState::Suspended:
+    case ThunkState::Native:
+        break;
+    }
+    // Phase D Step 7: skip queueing originally-tenured.  See
+    // fwdClosure for rationale.  Note: the leaf-tag fast paths above
+    // ALREADY skip queueing for trivially-no-pointer states; this
+    // gate generalises the skip to ALL tenured states once barrier
+    // coverage is validated.
+    if (__builtin_expect(phaseDStep7Active(), 1)) return t;
+    if (walked.insert(t).second) graylist.push_back({t, GK_THUNK});
+    return t;
+}
+
+ListVec * Scavenger::fwdList(ListVec * l)
+{
+    if (!l) return nullptr;
+    if (n.isPhaseEActive()) {
+        if (n.inYoung(l)) {
+            auto it = forward.find(l);
+            if (it != forward.end()) return static_cast<ListVec *>(it->second);
+            const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
+            void * dst = n.targetSurvivorAlloc(bytes);
+            const bool toSurv = (dst != nullptr);
+            if (!dst) dst = threadArena().alloc(bytes, CellType::List);  // B0.1: stamp type
+            std::memcpy(dst, l, bytes);
+            forward.emplace(l, dst);
+            graylist.push_back({dst, GK_LIST});
+            bytesSurvived += bytes;
+            if (toSurv) bytesPhaseEYToS    += bytes;
+            else        bytesPhaseEYToTOvf += bytes;
+            return static_cast<ListVec *>(dst);
+        }
+        if (n.inActiveSurvivor(l)) {
+            auto it = forward.find(l);
+            if (it != forward.end()) return static_cast<ListVec *>(it->second);
+            const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
+            void * dst = threadArena().alloc(bytes, CellType::List);  // B0.1: stamp type
+            std::memcpy(dst, l, bytes);
+            forward.emplace(l, dst);
+            graylist.push_back({dst, GK_LIST});
+            bytesSurvived += bytes;
+            bytesPhaseESToT += bytes;
+            return static_cast<ListVec *>(dst);
+        }
+    } else if (n.contains(l)) {
+        auto it = forward.find(l);
+        if (it != forward.end()) return static_cast<ListVec *>(it->second);
+        const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
+        void * dst = threadArena().alloc(bytes, CellType::List);  // B0.1: stamp type
+        std::memcpy(dst, l, bytes);
+        forward.emplace(l, dst);
+        graylist.push_back({dst, GK_LIST});
+        bytesSurvived       += bytes;
+        bytesPhaseEYToTOvf  += bytes;
+        return static_cast<ListVec *>(dst);
+    }
+    // #738 Phase E v0.2 force-walk tenured List — see fwdBindings.
+    if (n.isPhaseEActive()) {
+        if (walked.insert(l).second) graylist.push_back({l, GK_LIST});
+        return l;
+    }
+    // Phase D Step 7: skip queueing originally-tenured.  See fwdClosure.
+    if (__builtin_expect(phaseDStep7Active(), 1)) return l;
+    if (walked.insert(l).second) graylist.push_back({l, GK_LIST});
+    return l;
+}
+
+Bindings * Scavenger::fwdBindings(Bindings * b)
+{
+    if (!b) return nullptr;
+    // Bindings are tenured-only (alloc.hh allocBindings).  If we
+    // see a nursery Bindings here it means an allocator regressed;
+    // moving Bindings would orphan any Tag::Slot / Thunk::cell
+    // that points into entries[].
+    if (n.contains(b)) std::abort();
+    // #738 Phase E v0.2 — Phase D Step 7's "trust the dirty list"
+    // optimization is unsafe under Phase E for Bindings reached
+    // via path-roots (AttrSelectIC, bridge handle tables) that
+    // weren't dirtied by a mutator write because the Bindings was
+    // last-modified BEFORE the most recent mutator phase.  Under
+    // Phase E, the scavenger itself updates such Bindings' entries
+    // when forwarding Y/S→T → the new pointers may be in active-S
+    // and need re-barriering.  Force the walk under Phase E so
+    // walkBindings + its post-walk barrier handle the new edges.
+    if (n.isPhaseEActive()) {
+        if (walked.insert(b).second) graylist.push_back({b, GK_BINDINGS});
+        return b;
+    }
+    if (__builtin_expect(phaseDStep7Active(), 1)) return b;
+    if (walked.insert(b).second) graylist.push_back({b, GK_BINDINGS});
+    return b;
+}
+
+ValuePair * Scavenger::fwdPair(ValuePair * p)
+{
+    if (!p) return nullptr;
+    if (n.contains(p)) std::abort();  // pairs are tenured (allocPair)
+    // Fast path — left, right, AND evaluated all carry no v3-heap
+    // pointer.  `evaluated` (added 2026-05-18 for App memoisation)
+    // must be checked too: a forced Tag::App writes its WHNF result
+    // there, and a nursery payload in `evaluated` is a real root.
+    // #705 (2026-05-21): the missing `evaluated` check was the
+    // primary cause of hello.drvPath SIGSEGV under scavenge.
+    // 2026-05-30: include `third` slot (Tag::App3 arg2).  For
+    // Tag::App / Tag::PrimOpApp `third` stays Uninitialized
+    // (isLeafTag true) so the fast path is preserved.
+    if (isLeafTag(p->left.tag()) && isLeafTag(p->right.tag())
+        && isLeafTag(p->evaluated.tag())
+        && isLeafTag(p->third.tag())) return p;
+    // #738 Phase E v0.2 force-walk tenured Pair — see fwdBindings.
+    if (n.isPhaseEActive()) {
+        if (walked.insert(p).second) graylist.push_back({p, GK_PAIR});
+        return p;
+    }
+    // Phase D Step 7: same gate as the other fwd*().  Pair evaluated
+    // writes go through `pairSetEvaluated`; the dirty list catches.
+    if (__builtin_expect(phaseDStep7Active(), 1)) return p;
+    if (walked.insert(p).second) graylist.push_back({p, GK_PAIR});
+    return p;
+}
+
+void Scavenger::visitValue(Value & v)
+{
+    // -Werror=switch-enum requires explicit enumeration of every
+    // tag.  Leaf tags (Int / Float / Bool / Null / String / Path /
+    // PrimOp / Blackhole / External / Uninitialized) hold no v3-
+    // heap pointer to forward; they share an empty `break` body.
+    // `String` / `Path` reference arena-allocated `const char *`
+    // payloads which are tenured by definition.
+    switch (v.tag()) {
+    case Tag::Closure:
+        v.mkClosure(fwdClosure(v.asClosure()));
+        break;
+    case Tag::Thunk:
+        v.mkThunk(fwdThunk(v.asThunk()));
+        break;
+    case Tag::Attrs:
+        v.mkAttrs(fwdBindings(v.asAttrs()));
+        break;
+    case Tag::List:
+        v.mkList(fwdList(v.asList()));
+        break;
+    case Tag::App:
+    case Tag::App3:
+    case Tag::PrimOpApp:
+        // Preserve the existing pair-tag (App / App3 / PrimOpApp); only the
+        // ValuePair* is forwarded to its moved location.
+        v.mkPair(v.tag(), fwdPair(v.asPair()));
+        break;
+    case Tag::Slot: {
+        // Cells (Value *) are tenured; the slot pointer never moves.
+        // The Value AT the cell may carry a nursery payload, so we
+        // walk through.  We dedup via the same `walked` set so
+        // multiple slots aliasing the same cell don't double-walk.
+        Value * cell = v.asSlot();
+        if (cell && walked.insert(cell).second) {
+            visitValue(*cell);
+        }
+        break;
+    }
+    case Tag::Uninitialized:
+    case Tag::Int:
+    case Tag::Float:
+    case Tag::Bool:
+    case Tag::Null:
+    case Tag::String:
+    case Tag::Path:
+    case Tag::PrimOp:
+    case Tag::Blackhole:
+    case Tag::External:
+        break;
+    }
+}
+
+// #705 R9 (audit Round 2 N3): register every CU reached transitively
+// so its `attrSelectCache` IC entries are walked too.  Without this,
+// an OP_ATTRS_SELECT_IC hit on an IC entry whose Bindings is only
+// reachable via the cache slot (not via any other vm root) leaves
+// the Bindings's entries unforwarded → next hit returns a stale
+// Tag::Thunk payload.
+//
+// Drains immediately so any nursery Bindings the IC points at gets
+// queued for walkBindings (and its entries' nursery payloads
+// forwarded) inside the same scavenge pass.
+void Scavenger::walkClosure(Closure * c)
+{
+    // BRUTE-refinement (Phase 1.7 R1): record this object's tenured
+    // byte range so postScavengeBruteScan can filter hits to live
+    // (reachable-from-roots) objects only.
+    recordLiveTenured(c, closureScanSize(c), CellType::Closure);
+    const CompilationUnit * ccu = closureCU(c);  // P1b: was c->cu
+    if (ccu && walkedCUs.insert(ccu).second) {
+        for (const auto & ic : ccu->rt.attrSelectCache) {
+            for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
+                    fwdBindings(b);
+            }
+        }
+    }
+    if (c->capturedWiths) c->capturedWiths = fwdList(c->capturedWiths);
+    // env-sharing (NIX_V3_ENV_SHARING): upvalues live in a shared Env rather than
+    // the inline FAM.  The Env is TENURED (allocEnv → threadArena), so it never
+    // moves — we don't forward c->upvalEnv, only gray the Env so walkEnv forwards
+    // the nursery payloads it holds.  When upvalEnv is set the inline FAM is unused.
+    if (c->upvalEnv) {
+        if (walked.insert(c->upvalEnv).second)
+            graylist.push_back({c->upvalEnv, GK_ENV});
+    } else {
+        for (uint16_t i = 0; i < c->nUpvalues; ++i) {
+            visitValue(c->upvalues[i]);
+        }
+    }
+    // #738 Phase E v0.2 post-walk barrier — see walkList.
+    if (n.isPhaseEActive()) closurePostConstructBarrier(c);
+}
+
+// env-sharing: forward the nursery payloads a shared upvalue Env holds.  The Env
+// itself is tenured (non-moving) so there is no Env relocation; we only walk the
+// values[] FAM (mirror of walkClosure's upvalue loop) and re-arm the post-walk
+// barrier so a survivor Env that still references the nursery is remembered.
+void Scavenger::walkEnv(Env * e)
+{
+    recordLiveTenured(e, sizeof(Env) + sizeof(Value) * e->nValues, CellType::Env);
+    for (uint16_t i = 0; i < e->nValues; ++i) {
+        visitValue(e->values[i]);
+    }
+    // P0.A-4 (DEFECT_REVIEW_2026-07-03 §1.9): walk the Env::parent chain.  Env is
+    // TENURED (allocEnv → threadArena) and never moves, so gray the parent via
+    // GK_ENV (deduped by `walked`); the graylist drains it back through walkEnv,
+    // so an arbitrary-depth chain is handled iteratively (no C recursion).  This
+    // is a benign no-op today (no allocEnv caller sets `parent`), kept so no
+    // walker silently drops the chain the day a producer materializes one.
+    if (e->parent && walked.insert(e->parent).second)
+        graylist.push_back({e->parent, GK_ENV});
+    if (n.isPhaseEActive()) envPostConstructBarrier(e);
+}
+
+void Scavenger::walkThunk(Thunk * t)
+{
+    // BRUTE-refinement: Thunk size depends on state (matches fwdThunk's
+    // copy-size logic).  FP-2b: thunkScanSize includes the optional withs slot.
+    recordLiveTenured(t, thunkScanSize(t), CellType::Thunk);
+    // The cell (write-back target for OP_RETURN) is tenured; walk
+    // its current Value so any nursery payload it holds is found.
+    if (t->cell && walked.insert(t->cell).second) {
+        visitValue(*t->cell);
+    }
+    // M-8 (CODEBASE_REVIEW_2026-06-11): the shapeCell visit was removed with
+    // the field (the NIX_V3_CELL_EVERYWHERE experiment is gone).
+    switch (t->state) {
+    case ThunkState::Suspended:
+        if (const CompilationUnit * tcu = thunkCU(t); tcu && walkedCUs.insert(tcu).second) {  // FP-2a
+            for (const auto & ic : tcu->rt.attrSelectCache) {
+                for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                    if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
+                        fwdBindings(b);
+                }
+            }
+        }
+        if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
+            thunkSetCapturedWiths(t, fwdList(w));
+        if (Env * te = thunkUpvalEnv(t)) {
+            // env-sharing: upvalues live in the shared tenured Env (tail[0]); gray
+            // it so walkEnv forwards its nursery payloads (the Env never moves).
+            if (walked.insert(te).second) graylist.push_back({te, GK_ENV});
+        } else {
+            for (uint16_t i = 0; i < t->nUpvalues; ++i) {
+                visitValue(t->tail[i]);
+            }
+        }
+        break;
+    case ThunkState::Evaluated:
+        visitValue(t->evaluated);
+        break;
+    case ThunkState::Native:
+        // tail[] holds primop arguments; nUpvalues stores the
+        // arity for native thunks.
+        for (uint16_t i = 0; i < t->nUpvalues; ++i) {
+            visitValue(t->tail[i]);
+        }
+        break;
+    case ThunkState::Blackhole:
+        // Mirror Suspended: walk CU's AttrSelectIC (R9) too.
+        if (const CompilationUnit * tcu = thunkCU(t); tcu && walkedCUs.insert(tcu).second) {  // FP-2a
+            for (const auto & ic : tcu->rt.attrSelectCache) {
+                for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                    if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
+                        fwdBindings(b);
+                }
+            }
+        }
+        // #705 / N1 (2026-05-21 Round 2 GC audit): walk the
+        // Suspended-layout fields even while the thunk is Blackhole.
+        // The union variant is still `suspended` (state is just a
+        // marker that the body is currently executing); tail[i] hold
+        // the captured upvalues and suspended.capturedWiths the
+        // outer with-chain.
+        //
+        // Why this matters: `clearBlackMarksOnException` reverts
+        // Blackhole → Suspended on exception unwind (vm.cc ~9400).
+        // After the revert, OP_FORCE re-reads `t->tail[i]` and
+        // `t->suspended.capturedWiths` to rebuild the fakeClo
+        // (vm.cc ~6027 / 11089).  If a scavenge fired while the
+        // state was Blackhole, those fields hold stale nursery
+        // pointers → next force builds a fakeClo with stale upvalues
+        // → OP_TAIL_CALL / OP_GET_UPVALUE crash with desc=null
+        // (the "stale callee" / OOR signature we saw on
+        // hello.outPath and hello.drvPath).
+        //
+        // Trigger conditions (all common at workload scale):
+        //   - exception during a thunk body (assert / throw / addErrorContext)
+        //   - outer dispatch at exitDepth==0
+        //   - scavenge fires during the body
+        //
+        // Fix: identical to the Suspended case.
+        if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
+            thunkSetCapturedWiths(t, fwdList(w));
+        if (Env * te = thunkUpvalEnv(t)) {
+            // env-sharing: mirror the Suspended case (Blackhole shares the layout).
+            if (walked.insert(te).second) graylist.push_back({te, GK_ENV});
+        } else {
+            for (uint16_t i = 0; i < t->nUpvalues; ++i) {
+                visitValue(t->tail[i]);
+            }
+        }
+        break;
+    }
+    // #738 Phase E v0.2 post-walk barrier — see walkList.
+    if (n.isPhaseEActive()) thunkPostConstructBarrier(t);
+}
+
+void Scavenger::walkList(ListVec * l)
+{
+    recordLiveTenured(l, sizeof(ListVec) + sizeof(Value) * l->size, CellType::List);
+    for (uint32_t i = 0; i < l->size; ++i) {
+        visitValue(l->elems[i]);
+    }
+    // #738 Phase E v0.2 post-walk barrier reinstatement.  If Phase E
+    // is active and `l` is a tenured object (originally-tenured or
+    // newly-promoted from active-S to T), check whether the walk
+    // updated any interior pointer to point into nursery (= the new
+    // active-S after swap).  If so, re-add to dirtyContainers so the
+    // next scavenge finds this T→S edge.  The barrier early-outs
+    // when `l` is itself in nursery (newly-allocated S object), so
+    // it's safe to call unconditionally under Phase E.
+    if (n.isPhaseEActive()) listPostConstructBarrier(l);
+}
+
+void Scavenger::walkBindings(Bindings * b)
+{
+    recordLiveTenured(b, b->allocBytes(), CellType::Bindings);  // P1a: incl. MapAttrs aux tail
+    if (b->isMapAttrs())
+        visitValue(*b->mapAttrsAux());
+    for (uint32_t i = 0; i < b->size; ++i) {
+        visitValue(b->entries[i].value);
+    }
+    if (b->parent)
+        fwdBindings(const_cast<Bindings *>(b->parent));
+    // Phase E v0.2 post-walk barrier — see walkList.
+    if (n.isPhaseEActive()) bindingsPostConstructBarrier(b);
+}
+
+void Scavenger::walkPair(ValuePair * p)
+{
+    recordLiveTenured(p, sizeof(ValuePair), CellType::Pair);
+    visitValue(p->left);
+    visitValue(p->right);
+    // #705 (2026-05-21): `evaluated` field added 2026-05-18 (commit
+    // d3e41c13d) for App-result memoization.  Holds the WHNF result
+    // of a previously-forced Tag::App — a nursery payload here
+    // (Closure/Thunk/Bindings/List) was the missing root that made
+    // hello.drvPath SIGSEGV under scavenge.  When `evaluated` is
+    // Tag::Uninitialized, visitValue is a no-op.
+    visitValue(p->evaluated);
+    // 2026-05-30: `third` slot for Tag::App3 arg2.  Uninitialized
+    // for Tag::App / Tag::PrimOpApp; visitValue no-ops.
+    visitValue(p->third);
+    // Phase E v0.2 post-walk barrier — see walkList.
+    if (n.isPhaseEActive()) pairPostConstructBarrier(p);
+}
+
+void Scavenger::drain()
+{
+    while (!graylist.empty()) {
+        Gray g = graylist.back();
+        graylist.pop_back();
+        switch (g.kind) {
+        case GK_CLOSURE:  walkClosure (static_cast<Closure  *>(g.ptr)); break;
+        case GK_THUNK:    walkThunk   (static_cast<Thunk    *>(g.ptr)); break;
+        case GK_LIST:     walkList    (static_cast<ListVec  *>(g.ptr)); break;
+        case GK_BINDINGS: walkBindings(static_cast<Bindings *>(g.ptr)); break;
+        case GK_PAIR:     walkPair    (static_cast<ValuePair *>(g.ptr)); break;
+        case GK_ENV:      walkEnv     (static_cast<Env      *>(g.ptr)); break;
+        }
+    }
+}
+
+void Scavenger::run()
+{
+    // -- Stage 1: roots -----------------------------------------
+
+    // valueStack and withStack hold Value payloads at the top
+    // edge of the live VM state.  Every reachable runtime object
+    // is rooted from one of these (or via a frame's closure /
+    // thunk pointer below).
+    for (Value & v : vm.valueStack) visitValue(v);
+    for (Value & v : vm.withStack)  visitValue(v);
+
+    // #705 (2026-05-21): walk the OTHER active VMStates first
+    // (under nested runFunctionWithUpvalues / runFunction).  Their
+    // frames hold nursery closure/thunk pointers that the per-vm
+    // walk below wouldn't reach.  The nursery is shared across
+    // VMStates on the thread, so a scavenge fired from any vm must
+    // forward roots in ALL active vms.  Dedup happens via
+    // `walked.insert(...)` inside fwdXxx.
+    static const bool s_dbgVms =
+        std::getenv("V3_DBG_NURSERY") != nullptr;
+    std::unordered_set<VMState *> walkedVms{&vm};
+    for (VMState * other : activeVMStack()) {
+        if (!other || !walkedVms.insert(other).second) continue;
+        if (__builtin_expect(s_dbgVms, 0)) {
+            std::fprintf(stderr,
+                "  walking secondary vm=%p frames=%zu valueStack=%zu\n",
+                (void*)other, other->frames.size(), other->valueStack.size());
+        }
+        for (Value & v : other->valueStack) visitValue(v);
+        for (Value & v : other->withStack)  visitValue(v);
+        for (CallFrame & f : other->frames) {
+            if (f.closure)
+                f.closure = fwdClosure(const_cast<Closure *>(f.closure));
+            if (f.thunk)
+                f.thunk = fwdThunk(f.thunk);
+            if (f.forceWriteTarget) visitValue(*f.forceWriteTarget);
+            // Gray the frame's defEnv (see the main frame-walk below);
+            // always null today (env-capture deleted) — kept null-safe.
+            if (f.defEnv && walked.insert(f.defEnv).second)
+                graylist.push_back({f.defEnv, GK_ENV});
+        }
+    }
+
+    // Frames carry the call-chain's closure / thunk pointers.
+    // CallFrame::closure is `const Closure *` so we cast away
+    // const for the forward; the const is a documentation hint
+    // about who's allowed to mutate the closure body, not a
+    // GC-safety constraint.
+    for (CallFrame & f : vm.frames) {
+        if (f.closure) {
+            f.closure = fwdClosure(const_cast<Closure *>(f.closure));
+        }
+        if (f.thunk) {
+            f.thunk = fwdThunk(f.thunk);
+        }
+        // #705 (2026-05-21): forceWriteTarget is a Value*-pointer
+        // to a cell that an in-progress force will write its WHNF
+        // result into.  The cell pointer itself is tenured (always
+        // via Alloc::allocValue() or a Bindings entry slot), but
+        // its CURRENT content may carry a nursery payload that
+        // the audit's normal walks won't visit if the cell isn't
+        // otherwise reachable from valueStack/withStack/frames.
+        //
+        // Why this is a missed root: between OP_FORCE setting up
+        // writeback (flag bit + target pointer) and OP_RETURN /
+        // applyForceWriteback firing, the cell sits unreferenced
+        // by any visible Value EXCEPT through this frame field.
+        // If scavenge fires in that window, the cell's contents
+        // dangle.
+        //
+        // The fix: visit the cell's content as if it were on the
+        // value stack.  Safe even when the flag bit is clear —
+        // walking *cell is a no-op for tag::Uninitialized / leaf.
+        if (f.forceWriteTarget) {
+            // GC_AUDIT_ROUND_2 Round 1 #6 diagnostic: warn (under
+            // V3_DBG_NURSERY_FWT=1) if the writeback pointer itself
+            // sits inside the nursery.  The known case is
+            // OP_CALL_PRIMOP's deepForceList pre-pass storing
+            // `&list->elems[i]` for nursery-resident lists.  We
+            // walk the value the pointer references but do NOT
+            // update the pointer; the writeback after this
+            // scavenge will land in dead nursery bytes.  Per audit:
+            // silent memoization loss only, not a SIGSEGV — the
+            // next OP_CALL_PRIMOP scan re-derives WHNF on the
+            // forwarded copy.
+            static const bool s_dbgFwt =
+                std::getenv("V3_DBG_NURSERY_FWT") != nullptr;
+            if (__builtin_expect(s_dbgFwt, 0)
+                && n.contains(f.forceWriteTarget)) {
+                std::fprintf(stderr,
+                    "[v3-gc] forceWriteTarget=%p inside nursery; "
+                    "writeback after scavenge will be lost "
+                    "(latent — see Round 1 #6)\n",
+                    (void *)f.forceWriteTarget);
+            }
+            visitValue(*f.forceWriteTarget);
+        }
+        // The frame's defEnv would be a TENURED Env holding escaping locals.
+        // Gray it (GK_ENV) so walkEnv forwards its nursery payloads AND its
+        // parent chain (P0.A-4); the Env never moves.  ALWAYS NULL today (the
+        // env-capture experiment that populated it was deleted 2026-07-04);
+        // kept as null-safe scaffolding.  GC-CRITICAL if ever repopulated: a
+        // non-null defEnv reached only via the frame register would otherwise
+        // be a missed root.
+        if (f.defEnv && walked.insert(f.defEnv).second)
+            graylist.push_back({f.defEnv, GK_ENV});
+    }
+
+    // (bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02;
+    //  the v3BridgeClosures/Attrs/Lists tables are deleted.  rootVisit
+    //  below is still used by the remaining root walks.)
+    std::function<void(Value &)> rootVisit =
+        [this](Value & v) { visitValue(v); };
+
+    // #705 (2026-05-21): per-CompilationUnit AttrSelectIC roots.
+    // The IC caches `(Bindings*, slot)` pairs for OP_ATTRS_SELECT —
+    // when the same call site re-fires with a previously-seen Bindings
+    // pointer, it skips the binary search and reads
+    // `bindings->entries[slot].value` directly.
+    //
+    // Critical missed-root: a Bindings cached here can be reachable
+    // ONLY via this cache (no live valueStack/frame reference at
+    // scavenge time).  Scavenge wouldn't walk its entries → entries
+    // with nursery payloads dangle → next OP_ATTRS_SELECT IC hit
+    // returns a stale Tag::Thunk → forceValue crashes on
+    // `t->suspended.desc`.
+    //
+    // Identified 2026-05-21 by V3_DBG_NURSERY_BRUTE which found
+    // 502K stale nursery pointers in tenured arena memory after a
+    // "clean" deep audit — only path that could keep them reachable
+    // without showing in the graph walk.
+    //
+    // Walk each CU referenced by any frame, dedupe via a local set.
+    {
+        std::unordered_set<const CompilationUnit *> walkedCUs;
+        auto walkOneCU = [&](const CompilationUnit * cu) {
+            if (!cu) return;
+            if (!walkedCUs.insert(cu).second) return;
+            for (const auto & ic : cu->rt.attrSelectCache) {
+                for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                    if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
+                        fwdBindings(b);
+                }
+            }
+        };
+        for (CallFrame & f : vm.frames) walkOneCU(f.cu);
+        // Also walk via closures/thunks on the stack — they carry CU
+        // refs that may not be in any active frame.
+        for (Value & v : vm.valueStack) {
+            if (v.tag() == Tag::Closure && v.asClosure())
+                walkOneCU(closureCU(v.asClosure()));  // P1b: was ->cu
+            else if (v.tag() == Tag::Thunk && v.asThunk()
+                     && (v.asThunk()->state == ThunkState::Suspended
+                         || v.asThunk()->state == ThunkState::Blackhole))
+                walkOneCU(thunkCU(v.asThunk()));  // FP-2a: was suspended.cu
+        }
+        for (Value & v : vm.withStack) {
+            if (v.tag() == Tag::Closure && v.asClosure())
+                walkOneCU(closureCU(v.asClosure()));  // P1b: was ->cu
+            else if (v.tag() == Tag::Thunk && v.asThunk()
+                     && (v.asThunk()->state == ThunkState::Suspended
+                         || v.asThunk()->state == ThunkState::Blackhole))
+                walkOneCU(thunkCU(v.asThunk()));  // FP-2a: was suspended.cu
+        }
+    }
+
+    // #705 (2026-05-21): bytecode-primop replacement roots.  Each
+    // Value in `primopReplacementMap` may carry a nursery Closure
+    // (compiled by `installBytecodePrimop` via `runRootExpr`).  The
+    // map is consulted by every OP_LIT_PRIMOP / OP_CALL_PRIMOP
+    // dispatch; if the cached closure dangles, the next dispatch
+    // reads from freed nursery memory → forceValue chase finds a
+    // memset Thunk pointer and SIGSEGVs at `desc->nLocals`.  This
+    // walk closes the missed-root identified on hello.drvPath under
+    // NIX_V3_NURSERY_SCAVENGE=1.
+    walkBytecodePrimopRoots(rootVisit);
+
+    // #705 (2026-05-21): static `vBuiltins` Value root.  The
+    // bytecode-primop install path patches `vBuiltins.asAttrs()`
+    // entries in place to point at the freshly-compiled bytecode
+    // closures (see bytecode_primops.cc "Install path 3" — patches
+    // `b->entries[i].value = installed.rr.value`).  Those entries
+    // can carry nursery Closures.  Walk so they're forwarded.
+    walkBuiltinsRoot(rootVisit);
+
+    // #705 (2026-05-21): import-cache results.  Each entry holds a
+    // Value whose payload may carry nursery Closure/Bindings — a
+    // repeat builtins.import after scavenge would otherwise return
+    // a stale pointer.
+    walkImportCacheRoots(rootVisit);
+    walkAppliedCacheRoots(rootVisit);  // LEVER-1 applied cache (same UAF class)
+
+    // #705 (2026-05-21): cached call-flake closure.  Set once at
+    // first getFlake; closure may be nursery-allocated.
+    walkCallFlakeRoot(rootVisit);
+
+    // GC_AUDIT_ROUND_2 Round 1 #7 (2026-05-21): deep-force roots.
+    // `print.cc::forceDeep`, `printNixValueRich(out, vm, ...)`, and
+    // `toJsonValue(vm, ...)` walk Values whose `asList()` /
+    // `asAttrs()` C-locals live across recursive `forceValue`
+    // calls.  When invoked at `vm.frames.empty()` (post-eval print /
+    // JSON dump from the CLI), the inner forceValue enters
+    // dispatchLoop at exitDepth==0 → scavenge enabled → the C-locals
+    // dangle if the container is forwarded.  The fix: each of those
+    // call sites pushes its current Value onto a thread-local
+    // index-addressable root stack here, accesses the container
+    // through the stack slot (not the C-local), and pops on exit.
+    // The scavenger walks the slots so their payload pointers
+    // forward correctly across nested scavenges.
+    walkDeepForceRoots(rootVisit);
+
+    // #558 Phase 3.3: partialBindingsRegistry retired (no longer
+    // referenced by vm.cc).  No scavenge work needed.
+
+    // Phase D (Stage 3, 2026-05-21): drain the inter-gen dirty-list.
+    //
+    // Each entry is a tenured Bindings / ValuePair / Thunk whose
+    // contents were mutated to point at a nursery payload since the
+    // last scavenge.  The natural-root walk above won't necessarily
+    // reach these (e.g. a Bindings on the heap that's only
+    // referenced from another tenured container, where the only edge
+    // is through a Tag::Slot from a tenured cell that wasn't
+    // otherwise reachable from valueStack/withStack/frames).  The
+    // dirty-list is the remembered-set that closes the gap.
+    //
+    // walked-set dedup handles duplicate entries (a single container
+    // pushed multiple times for multiple writes) for free.
+    //
+    // See `lode/NURSERY_PHASE_D_DECISION_2026-05-21.md` §2.3 for
+    // design rationale + §4 Step 6 for the implementation contract.
+    {
+        auto & dirty = dirtyContainers();
+        for (const DirtyEntry & e : dirty) {
+            void * ptr = e.ptr();
+            switch (e.kind()) {
+            case DirtyKind::Bindings: {
+                auto * b = static_cast<Bindings *>(ptr);
+                if (walked.insert(b).second) {
+                    graylist.push_back({b, GK_BINDINGS});
+                }
+                break;
+            }
+            case DirtyKind::Pair: {
+                auto * p = static_cast<ValuePair *>(ptr);
+                if (walked.insert(p).second) {
+                    graylist.push_back({p, GK_PAIR});
+                }
+                break;
+            }
+            case DirtyKind::Thunk: {
+                auto * t = static_cast<Thunk *>(ptr);
+                if (walked.insert(t).second) {
+                    graylist.push_back({t, GK_THUNK});
+                }
+                break;
+            }
+            case DirtyKind::Closure: {
+                auto * c = static_cast<Closure *>(ptr);
+                if (walked.insert(c).second) {
+                    graylist.push_back({c, GK_CLOSURE});
+                }
+                break;
+            }
+            case DirtyKind::List: {
+                auto * l = static_cast<ListVec *>(ptr);
+                if (walked.insert(l).second) {
+                    graylist.push_back({l, GK_LIST});
+                }
+                break;
+            }
+            case DirtyKind::Env: {
+                auto * env = static_cast<Env *>(ptr);
+                if (walked.insert(env).second) {
+                    graylist.push_back({env, GK_ENV});
+                }
+                break;
+            }
+            }
+        }
+        auto releaseIfOversized = [](auto & v, size_t maxRetained) {
+            if (v.empty() && v.capacity() > maxRetained) {
+                using Vec = std::decay_t<decltype(v)>;
+                Vec trimmed;
+                trimmed.reserve(maxRetained);
+                v.swap(trimmed);
+            }
+        };
+        // Clear retaining modest capacity for the steady-state case, but do
+        // not keep multi-MB remembered-set spikes alive after the scavenge.
+        // python3.drvPath can transiently grow this past 1M entries and then
+        // carry an empty 8+ MB vector through the rest of evaluation.
+        dirty.clear();
+        releaseIfOversized(dirty, 64 * 1024);
+
+        // Standalone cells: the cell pointers themselves are
+        // tenured (`Alloc::allocValue`), but their CONTENTS may
+        // hold a nursery payload.  Walk each cell as a root.
+        //
+        // #738 Phase E v0.2: under Phase E, the cell's content might
+        // be forwarded to active-S (still nursery!) rather than to
+        // tenured.  Under Phase D this never happened — survivors
+        // always went to tenured, so clearing the cell registry
+        // was safe.  Under Phase E we must keep cells in the
+        // registry if they still point into nursery after walking,
+        // otherwise the active-S referent becomes unreachable from
+        // the dirty-list-equivalent and the next scavenge misses it.
+        auto & cells = standaloneCellRoots();
+        if (n.isPhaseEActive()) {
+            // Filter in place: keep cells whose updated content
+            // still references nursery (active-S or new survivor in
+            // the inactive buffer).  Drop cells that now hold tenured
+            // pointers (they no longer need tracking until the mutator
+            // writes a new nursery pointer through them).
+            size_t kept = 0;
+            for (Value * cell : cells) {
+                visitValue(*cell);
+                if (isNurseryPayload(*cell, n))
+                    cells[kept++] = cell;
+            }
+            cells.resize(kept);
+            releaseIfOversized(cells, 16 * 1024);
+        } else {
+            // Legacy Phase D: every survivor went to tenured, so
+            // post-walk cells hold tenured payloads.  Clear the
+            // registry; mutator barriers will repopulate.
+            for (Value * cell : cells) {
+                visitValue(*cell);
+            }
+            cells.clear();
+            releaseIfOversized(cells, 16 * 1024);
+        }
+    }
+
+    // Captured-withs singleton cache slots.  These are libc/static slots in
+    // vm.cc, not arena objects and not visible from the VM stacks.  Forward the
+    // cached ListVec pointers in place so the singleton cache remains sound
+    // under the moving nursery.
+    for (ListVec ** slot : singletonCapturedWithsRegistry()) {
+        if (slot && *slot)
+            *slot = fwdList(*slot);
+    }
+
+    // -- Stage 2: walk graylist ---------------------------------
+
+    drain();
+    refreshCapWithsCacheAfterScavenge();
+
+    // -- Stage 3: reset bump pointer ----------------------------
+    // forward / walked / graylist live in `threadScavengeBuffers()`
+    // and will be cleared by the next call to `scavengeNursery`.
+    // Leaving them populated until then is harmless and saves the
+    // hash-table hashing-pass that `clear()` does when called now.
+
+    // #738 Phase E v0.2: under Phase E, the reset path differs —
+    // young is reset AND the just-promoted active survivor is reset
+    // AND the active idx is flipped so the buffer that just received
+    // Y survivors becomes the new active S.  Legacy single-region
+    // behaviour falls through to `resetBumpAfterScavenge`.
+    if (n.isPhaseEActive()) {
+        n.swapAndResetAfterScavenge();
+        n.recordPhaseEBytes(bytesPhaseEYToS,
+                            bytesPhaseESToT,
+                            bytesPhaseEYToTOvf);
+    } else {
+        n.resetBumpAfterScavenge();
+        // Phase D (legacy) — survivors mapped to overflow slot.
+        n.recordPhaseEBytes(0, 0, bytesPhaseEYToTOvf);
+    }
+}
+
+} // namespace
+
+// #705 post-scavenge audit (gated via V3_DBG_NURSERY_AUDIT=1).
+// Walks DEEP from the scavenger's roots and asserts no nursery
+// pointer remains anywhere reachable.  Localizes a missed-root.
+namespace {
+
+struct Auditor {
+    const Nursery & n;
+    std::unordered_set<const void *> visited;
+    // #705 R6 (audit Round 2): mirror scavenger's walkedCUs so the
+    // audit also walks AttrSelectIC entries transitively.
+    std::unordered_set<const CompilationUnit *> walkedCUs;
+    bool ok = true;
+    const char * root = "?";   // S2.1 RCA: top-level root of the current walk
+
+    void check(const void * p, const char * what, const char * site)
+    {
+        if (n.contains(p)) {
+            std::fprintf(stderr,
+                "v3 SCAVENGE AUDIT: nursery %s %p reachable via %s [root=%s]\n",
+                what, p, site, root);
+            ok = false;
+        }
+    }
+
+    void visitValue(const Value & v, const char * site);
+    // Forward decl: visitBindings defined further down in the struct.
+
+    void walkCUAttrSelectCache(const CompilationUnit * cu)
+    {
+        if (!cu || !walkedCUs.insert(cu).second) return;
+        for (const auto & ic : cu->rt.attrSelectCache) {
+            for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                if (const Bindings * b = ic.entries[w].bindings)
+                    visitBindings(b, "CU.attrSelectCache");
+            }
+        }
+    }
+
+    void visitClosure(const Closure * c, const char * site)
+    {
+        if (!c) return;
+        check(c, "Closure", site);
+        if (!visited.insert(c).second) return;
+        walkCUAttrSelectCache(closureCU(c));  // P1b: was c->cu
+        if (c->capturedWiths) check(c->capturedWiths, "Closure.capturedWiths", site);
+        if (c->capturedWiths) {
+            for (uint32_t i = 0; i < c->capturedWiths->size; ++i)
+                visitValue(c->capturedWiths->elems[i], "Closure.capturedWiths.elem");
+        }
+        // env-sharing: upvalues live in a shared Env, not the inline FAM.
+        if (c->upvalEnv)
+            visitEnv(c->upvalEnv, "Closure.upvalEnv");
+        else
+            for (uint16_t i = 0; i < c->nUpvalues; ++i)
+                visitValue(c->upvalues[i], "Closure.upvalues[]");
+    }
+
+    void visitEnv(const Env * e, const char * site)
+    {
+        if (!e) return;
+        check(e, "Env", site);
+        if (!visited.insert(e).second) return;
+        for (uint16_t i = 0; i < e->nValues; ++i)
+            visitValue(e->values[i], "Env.values[]");
+        // P0.A-4 (§1.9): walk the Env::parent chain.  `visited` dedups, so
+        // this recursion is cycle-safe.
+        if (e->parent) visitEnv(e->parent, "Env.parent");
+    }
+
+    void visitThunk(const Thunk * t, const char * site)
+    {
+        if (!t) return;
+        check(t, "Thunk", site);
+        if (!visited.insert(t).second) return;
+        if (t->cell) {
+            // cell is tenured Value*; its content may transitively
+            // reach nursery.  Recurse into the cell value.
+            visitValue(*t->cell, "Thunk.cell");
+        }
+        // M-8: shapeCell visit removed with the field.
+        switch (t->state) {
+        case ThunkState::Suspended:
+            // #705 R9: walk this CU's IC.
+            walkCUAttrSelectCache(thunkCU(t));  // FP-2a: was t->suspended.cu
+            if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
+                check(w, "Thunk.suspended.capturedWiths", site);
+            if (Env * te = thunkUpvalEnv(t))
+                visitEnv(te, "Thunk.suspended.upvalEnv");  // env-sharing
+            else {
+                for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                    visitValue(t->tail[i], "Thunk.suspended.tail[]");
+            }
+            break;
+        case ThunkState::Native:
+            // N7 (audit Round 2): Suspended and Native have DIFFERENT
+            // union variants.  Native's variant is { const PrimOp * fn },
+            // no capturedWiths / cu / desc.  Reading those fields here
+            // is out-of-bounds.  Just walk the tail[] which holds the
+            // primop's accumulated args (still valid).
+            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                visitValue(t->tail[i], "Thunk.Native.tail[]");
+            break;
+        case ThunkState::Evaluated:
+            visitValue(t->evaluated, "Thunk.evaluated");
+            break;
+        case ThunkState::Blackhole:
+            // #705 / N1: mirror scavenger's Blackhole walk — tail and
+            // suspended.capturedWiths are live because
+            // clearBlackMarksOnException can revert Blackhole →
+            // Suspended on exception unwind.  See gc.cc walkThunk.
+            walkCUAttrSelectCache(thunkCU(t));  // FP-2a: was t->suspended.cu
+            if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
+                check(w,
+                      "Thunk.Blackhole.suspended.capturedWiths", site);
+            if (Env * te = thunkUpvalEnv(t))
+                visitEnv(te, "Thunk.Blackhole.upvalEnv");  // env-sharing
+            else {
+                for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                    visitValue(t->tail[i], "Thunk.Blackhole.tail[]");
+            }
+            break;
+        }
+    }
+
+    void visitBindings(const Bindings * b, const char * site)
+    {
+        if (!b) return;
+        check(b, "Bindings", site);
+        if (!visited.insert(b).second) return;
+        // Phase D diagnostic: include the Bindings pointer + entry
+        // index when a child value is nursery-resident — helps trace
+        // back to the construction site.  Also pulls in the
+        // NIX_V3_DBG_BINDINGS_ORIGIN tag when enabled.
+        const BindingsOrigin * origin = lookupBindingsOrigin(b);
+        const char * originSrc = origin ? origin->source : "(no-origin)";
+        if (b->isMapAttrs())
+            visitValue(*b->mapAttrsAux(), "Bindings.mapAttrs.fn");
+        for (uint32_t i = 0; i < b->size; ++i) {
+            // Build a per-entry site string so the audit message
+            // identifies which Bindings + which entry + origin.
+            // PhD-6: append the last-writer (gated) so a missed-root entry
+            // names the barrier setter that last wrote it + whether it dirtied.
+            const char * lastWriter = "?";
+            if (__builtin_expect(dbgCellWriteSite(), 0)) {
+                auto & m = cellWriteSiteMap();
+                auto it = m.find(&b->entries[i].value);
+                lastWriter = (it != m.end()) ? it->second
+                                             : "(no-recorded-writer=raw/bulk-path)";
+            }
+            char ebuf[224];
+            std::snprintf(ebuf, sizeof(ebuf),
+                "Bindings(%p)[%s].entries[%u].value lastWriter=%s",
+                (const void *)b, originSrc, i, lastWriter);
+            visitValue(b->entries[i].value, ebuf);
+        }
+        if (b->parent)
+            visitBindings(b->parent, "Bindings.parent");
+    }
+
+    void visitList(const ListVec * l, const char * site)
+    {
+        if (!l) return;
+        check(l, "ListVec", site);
+        if (!visited.insert(l).second) return;
+        // PhD-6 (2026-06-15): the missed-root proved to be a nursery THUNK
+        // (a lazily-built element, NOT a forced WHNF) held in a TENURED list.
+        // Such a list is arena-allocated only because the nursery was full at
+        // allocList time (alloc.hh nurseryOrArena); its pointer is stable, so
+        // the listOriginTable (NIX_V3_LISTS_ATTR=1) alloc-site lookup HITS and
+        // names the exact construction site that filled it with nursery thunks
+        // WITHOUT a listPostConstructBarrier.  Also keep the last-writer lookup
+        // (cellWrite/bindings setters) for the writeback case.
+        ListOrigin lo{"?", 0, 0};
+        if (__builtin_expect(listsAttrEnabled(), 0)) {
+            auto & ot = listOriginTable();
+            auto oit = ot.find(l);
+            if (oit != ot.end()) lo = oit->second;
+        }
+        for (uint32_t i = 0; i < l->size; ++i) {
+            const char * lastWriter = "?";
+            if (__builtin_expect(dbgCellWriteSite(), 0)) {
+                auto & m = cellWriteSiteMap();
+                auto it = m.find(&l->elems[i]);
+                lastWriter = (it != m.end()) ? it->second
+                                             : "(no-recorded-writer=raw/bulk-path)";
+            }
+            char ebuf[224];
+            std::snprintf(ebuf, sizeof(ebuf),
+                "ListVec(%p sz=%u allocAt=%s:%u).elems[%u] lastWriter=%s",
+                (const void *)l, l->size, lo.file, lo.line, i, lastWriter);
+            visitValue(l->elems[i], ebuf);
+        }
+    }
+
+    void visitPair(const ValuePair * p, const char * site)
+    {
+        if (!p) return;
+        check(p, "ValuePair", site);
+        if (!visited.insert(p).second) return;
+        visitValue(p->left,      "ValuePair.left");
+        visitValue(p->right,     "ValuePair.right");
+        visitValue(p->evaluated, "ValuePair.evaluated");
+        visitValue(p->third,     "ValuePair.third");  // 2026-05-30 Tag::App3 arg2
+    }
+};
+
+void Auditor::visitValue(const Value & v, const char * site)
+{
+    switch (v.tag()) {
+    case Tag::Closure:  visitClosure(v.asClosure(),   site); break;
+    case Tag::Thunk:    visitThunk  (v.asThunk(),     site); break;
+    case Tag::Attrs:    visitBindings(v.asAttrs(), site); break;
+    case Tag::List:     visitList   (v.asList(),      site); break;
+    case Tag::App:
+    case Tag::App3:
+    case Tag::PrimOpApp: visitPair  (v.asPair(),      site); break;
+    case Tag::Slot:
+        if (v.asSlot()) visitValue(*v.asSlot(), "Slot.cell");
+        break;
+    case Tag::Uninitialized:
+    case Tag::Int:
+    case Tag::Float:
+    case Tag::Bool:
+    case Tag::Null:
+    case Tag::String:
+    case Tag::Path:
+    case Tag::PrimOp:
+    case Tag::Blackhole:
+    case Tag::External:
+        break;
+    }
+}
+
+void postScavengeAudit(const Nursery & n, const VMState & vm)
+{
+    Auditor a{n, {}, {}, true};
+    // #705 R6 (2026-05-21 audit round 2 #8): mirror EVERY root the
+    // scavenger walks, so a clean audit verdict is actually a
+    // statement of "no nursery pointer reachable from any walked
+    // root."  Pre-R6 the auditor walked only valueStack/withStack/
+    // frames, missing bridge tables / primopReplacementMap /
+    // vBuiltins / importCache / callFlake / AttrSelectIC /
+    // forceWriteTarget / active-VMStack — any of those holding a
+    // stale pointer would produce a false-positive clean verdict.
+
+    // 1. Per-vm roots (current + every other active VMState on the
+    //    thread — same set the scavenger walks via activeVMStack).
+    auto walkVm = [&](const char * label, const VMState * vmp) {
+        if (!vmp) return;
+        a.root = label;   // S2.1 RCA
+        for (size_t i = 0; i < vmp->valueStack.size(); ++i)
+            a.visitValue(vmp->valueStack[i], label);
+        for (size_t i = 0; i < vmp->withStack.size(); ++i)
+            a.visitValue(vmp->withStack[i], label);
+        for (size_t i = 0; i < vmp->frames.size(); ++i) {
+            const CallFrame & f = vmp->frames[i];
+            if (f.closure) a.visitClosure(f.closure, "frame.closure");
+            if (f.thunk)   a.visitThunk  (f.thunk,   "frame.thunk");
+            // Round 1 #6: forceWriteTarget points at a tenured Value
+            // cell; the contents may carry nursery payloads.
+            if (f.forceWriteTarget)
+                a.visitValue(*f.forceWriteTarget, "frame.forceWriteTarget");
+            // Audit the frame's defEnv (+ parent chain via the auditor's
+            // visitEnv, P0.A-4).  Always null today (env-capture deleted);
+            // kept null-safe.
+            if (f.defEnv) a.visitEnv(f.defEnv, "frame.defEnv");
+        }
+    };
+    walkVm("currentVm", &vm);
+    std::unordered_set<const VMState *> seenVms{&vm};
+    for (VMState * other : activeVMStack()) {
+        if (!other || !seenVms.insert(other).second) continue;
+        walkVm("otherVm", other);
+    }
+
+    // (2. bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
+
+    // 3. Bytecode-primop replacement map (bytecode_primops.cc).
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.root = "primopReplacementMap"; a.visitValue(v, "primopReplacementMap"); };
+        walkBytecodePrimopRoots(visit);
+    }
+
+    // 4. vBuiltins singleton.
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.root = "vBuiltins"; a.visitValue(v, "vBuiltins"); };
+        walkBuiltinsRoot(visit);
+    }
+
+    // 5. import-cache results.
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.root = "importCache"; a.visitValue(v, "importCache"); };
+        walkImportCacheRoots(visit);
+        walkAppliedCacheRoots(visit);  // LEVER-1 applied cache
+    }
+
+    // 6. call-flake closure.
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.root = "callFlakeRoot"; a.visitValue(v, "callFlakeRoot"); };
+        walkCallFlakeRoot(visit);
+    }
+
+    // 6b. deep-force roots (Round 1 #7).  See gc.cc:run() comment.
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.root = "deepForceRoots"; a.visitValue(v, "deepForceRoots"); };
+        walkDeepForceRoots(visit);
+    }
+
+    // 6c. Phase D inter-gen dirty list (2026-05-21).  At AUDIT
+    // time the scavenger has already drained the list; this is a
+    // diagnostic-parity walk that catches missed-drain regressions.
+    // The list will normally be empty by the time auditor runs.
+    {
+        a.root = "dirtyList";   // S2.1 RCA
+        for (const DirtyEntry & e : dirtyContainers()) {
+            void * ptr = e.ptr();
+            switch (e.kind()) {
+            case DirtyKind::Bindings:
+                if (a.visited.insert(ptr).second)
+                    a.visitBindings(static_cast<Bindings *>(ptr), "dirty.Bindings");
+                break;
+            case DirtyKind::Pair:
+                if (a.visited.insert(ptr).second)
+                    a.visitPair(static_cast<ValuePair *>(ptr), "dirty.Pair");
+                break;
+            case DirtyKind::Thunk:
+                if (a.visited.insert(ptr).second)
+                    a.visitThunk(static_cast<Thunk *>(ptr), "dirty.Thunk");
+                break;
+            case DirtyKind::Closure:
+                if (a.visited.insert(ptr).second)
+                    a.visitClosure(static_cast<Closure *>(ptr), "dirty.Closure");
+                break;
+            case DirtyKind::List:
+                if (a.visited.insert(ptr).second)
+                    a.visitList(static_cast<ListVec *>(ptr), "dirty.List");
+                break;
+            case DirtyKind::Env:
+                if (a.visited.insert(ptr).second)
+                    a.visitEnv(static_cast<Env *>(ptr), "dirty.Env");
+                break;
+            }
+        }
+        a.root = "standaloneCell";   // S2.1 RCA
+        for (Value * cell : standaloneCellRoots()) {
+            a.visitValue(*cell, "dirty.cell");
+        }
+    }
+
+    // 6d. Captured-withs singleton cache slots.  Mirrors the scavenger's
+    // explicit slot forwarding above.
+    a.root = "capWithsCache";   // S2.1 RCA
+    for (ListVec ** slot : singletonCapturedWithsRegistry()) {
+        if (slot && *slot)
+            a.visitList(*slot, "capWithsCache");
+    }
+
+    // 7. AttrSelectIC entries via reached Closures / Thunks.
+    //    Already handled implicitly: visitClosure / visitThunk above
+    //    queue the IC entries' Bindings via the walkedCUs/visited
+    //    deduplication.  No extra step needed here — but if R6 is
+    //    ever reorganized, add explicit IC walks per CU.
+
+    if (a.ok) {
+        std::fprintf(stderr,
+            "v3 SCAVENGE AUDIT: clean (deep walk found no nursery pointers)\n");
+    } else {
+        std::fprintf(stderr,
+            "v3 SCAVENGE AUDIT: visited=%zu objects; pointers above are stale\n",
+            a.visited.size());
+    }
+    std::fflush(stderr);
+}
+
+// #705 (2026-05-21): brute-force tenured-arena scan.
+//
+// Gated V3_DBG_NURSERY_BRUTE=1 (separate from AUDIT because it's
+// expensive — O(arena_size) per scavenge).  Walks every 8-byte
+// aligned word in every tenured arena block and checks whether the
+// word is a pointer into the nursery range.  Hits reveal exactly
+// which arena offset holds a stale nursery pointer that the deep
+// reachable-graph audit missed.
+//
+// Phase 1.7 R1 refinement (2026-05-21): filter to LIVE objects only.
+// Without filtering, BRUTE flags every tenured byte that happens to
+// hold a pointer-shaped value inside the nursery range, including
+// dead-but-arena-resident objects (Boehm pins the whole arena as a
+// root → dead Closures / Bindings stay in memory with their stale
+// nursery pointers).  Those hits are harmless noise — no one
+// dereferences a dead object.  The real signal is hits inside
+// objects the scavenger considers REACHABLE; those represent true
+// missed-root bugs where a live object holds a pointer the
+// scavenger failed to forward.
+//
+// Implementation: the Scavenger records [start, end) byte ranges
+// for every tenured object it walked into `liveTenuredRanges`;
+// they're sorted by start address after drain() and passed here.
+// We classify each hit as "live" (inside one of the ranges) or
+// "dead" (outside) and report counts separately.  A live hit is
+// the Phase 1.7 stop-the-world signal.
+//
+// `liveRanges` MUST be sorted by start ascending; the caller is
+// responsible.  Binary search via std::upper_bound for O(log N)
+// per word.
+} // namespace
+
+// #34 (2026-07-06): scalar-slot classifier for the BRUTE raw-word scan.  See
+// gc.hh for the rationale.  Offsets track the CURRENT cell layouts (Bindings
+// header 16B post-P1a; Closure header 32B post-P1b) — update on any change.
+bool bruteScanSlotIsScalar(uint8_t cellType, size_t off) noexcept
+{
+    switch (static_cast<CellType>(cellType)) {
+    case CellType::Bindings:
+        // header 16B: [0,8)=kind/size SCALAR; parent@[8,16) is a pointer.
+        // entry 16B: [+0,+8)={SymbolId,PosIdx32} SCALAR; value@[+8,+16) is a Value.
+        return (off < 8) || (off >= 16 && ((off - 16) % 16) < 8);
+    case CellType::Env:     return (off >= 8 && off < 16);   // {isWithEnv,nValues}
+    case CellType::Closure: return (off >= 24 && off < 32);  // {nUpvalues,_pad}
+    case CellType::Thunk:   return (off < 8);                // {state,hasWithsSlot,nUpvalues,forces}
+    case CellType::List:    return (off < 8);                // {size,_pad}
+    case CellType::None: case CellType::Value:
+    case CellType::Pair: case CellType::Chars:
+        return false;  // Pair/Value: all-Value slots; Chars/None: opaque
+    }
+    return false;
+}
+
+namespace {
+
+void postScavengeBruteScan(
+    const Nursery & n,
+    const std::vector<ScavLiveRange> & liveRanges)
+{
+    Arena & arena = threadArena();
+    auto blocks = arena.blockRanges();
+    // Predicate: which live range contains address p?  Binary search for the
+    // largest range whose start <= p, then check end > p.  Returns the range
+    // (so the caller can TYPE the holder + compute the field offset) or null.
+    auto inLive = [&](uintptr_t p) -> const ScavLiveRange * {
+        auto it = std::upper_bound(  // first range with lo > p
+            liveRanges.begin(), liveRanges.end(), p,
+            [](uintptr_t v, const ScavLiveRange & r) { return v < r.lo; });
+        if (it == liveRanges.begin()) return nullptr;
+        --it;
+        return (p < it->hi) ? &*it : nullptr;  // it->lo <= p < it->hi
+    };
+    // PhD-6: CellType -> short name for the BRUTE holder-typing dump.
+    auto typeName = [](uint8_t t) -> const char * {
+        switch (static_cast<CellType>(t)) {
+        case CellType::Value:    return "Value";
+        case CellType::Closure:  return "Closure";
+        case CellType::Thunk:    return "Thunk";
+        case CellType::Bindings: return "Bindings";
+        case CellType::List:     return "List";
+        case CellType::Pair:     return "ValuePair";
+        case CellType::Env:      return "Env";
+        case CellType::Chars:    return "Chars";
+        case CellType::None:     return "None";
+        }
+        return "None";
+    };
+
+    size_t hitsLive = 0;
+    size_t hitsDead = 0;
+    size_t hitsScalarFalsePos = 0;  // #34: raw-word hits filtered as scalar slots
+    size_t cap = 16;  // dump first N LIVE hits (dead hits are noise; just count)
+    for (auto & blk : blocks) {
+        // Walk 8-byte aligned words.
+        const uintptr_t step = 8;
+        uintptr_t lo = reinterpret_cast<uintptr_t>(blk.begin);
+        uintptr_t hi = reinterpret_cast<uintptr_t>(blk.end);
+        lo = (lo + step - 1) & ~(step - 1);  // align up
+        for (uintptr_t p = lo; p + step <= hi; p += step) {
+            uintptr_t w = *reinterpret_cast<const uintptr_t *>(p);
+            if (w == 0) continue;
+            if (!n.contains(reinterpret_cast<const void *>(w))) continue;
+            if (const ScavLiveRange * r = inLive(p)) {
+                const size_t off = (size_t)(p - r->lo);
+                // #34 FIX (2026-07-06): SKIP provably-NON-POINTER scalar/metadata
+                // slots.  This raw-word scan otherwise flags e.g. a Bindings
+                // entry's packed {SymbolId,PosIdx32} word when its 64-bit value
+                // coincidentally lands in the nursery's ASLR-varying address range
+                // — a ~0.07%/run TOOLING FALSE-POSITIVE (RCA 2026-07-06: nursery
+                // high-32 matches a PosIdx and low-32 lands in the SymbolId range;
+                // AUDIT precise-walk is CLEAN, so it is NOT a real missed root).
+                // A pointer never lives in a scalar slot, so skipping cannot hide
+                // a real missed root; the AUDIT deep-walk remains the precise
+                // reachability check.  Offsets track the CURRENT cell layouts
+                // (update on any header change — e.g. P1a Bindings 24->16B, P1b
+                // Closure 40->32B).
+                if (bruteScanSlotIsScalar(r->type, off)) {
+                    ++hitsScalarFalsePos; continue;
+                }
+                if (hitsLive < cap) {
+                    // PhD-6: type the HOLDER + field offset so the missed-root
+                    // edge is identifiable.  Decode the word as a Value too: a
+                    // genuine Value-pointer slot has a POINTER tag.
+                    Value asVal; asVal.w = w;
+                    std::fprintf(stderr,
+                        "v3 SCAVENGE BRUTE: arena word @ %p holds nursery "
+                        "pointer %p  [holder=%s @+%zu, size=%zu | "
+                        "pointer-capable slot | word-as-Value: tag=%d ptr-tagged=%s]\n",
+                        (void*)p, (void*)w, typeName(r->type),
+                        off, (size_t)(r->hi - r->lo),
+                        (int)asVal.tag(), tagIsPointer(asVal.tag()) ? "yes" : "no");
+                }
+                ++hitsLive;
+            } else {
+                ++hitsDead;
+            }
+        }
+    }
+    // #34 RCA near-miss pass: for the SCALAR {SymbolId,PosIdx32} words of every
+    // LIVE tenured Bindings entry, measure the closest approach to the nursery.
+    // If scalar words routinely land NEAR the nursery's ASLR-varying range, the
+    // conservative raw-word BRUTE scan CAN false-positive when the exact window
+    // aligns (the rare flake).  Gated on V3_DBG_NURSERY_BRUTE_NEARMISS to keep
+    // the default brute path unchanged.
+    static const bool s_nearMiss = std::getenv("V3_DBG_NURSERY_BRUTE_NEARMISS") != nullptr;
+    if (__builtin_expect(s_nearMiss, 0)) {
+        uintptr_t minDist = ~uintptr_t(0);
+        uintptr_t minWord = 0;
+        size_t scalarWords = 0, near4G = 0, near256M = 0, near1M = 0;
+        for (const auto & r : liveRanges) {
+            if (static_cast<CellType>(r.type) != CellType::Bindings) continue;
+            if (r.hi <= r.lo + 16) continue;
+            size_t nEntries = (r.hi - r.lo - 16) / 16;
+            for (size_t i = 0; i < nEntries; ++i) {
+                uintptr_t sp = r.lo + 16 + 16 * i;  // {SymbolId,PosIdx32} word
+                uintptr_t sw = *reinterpret_cast<const uintptr_t *>(sp);
+                if (sw == 0) continue;
+                ++scalarWords;
+                uintptr_t d = n.minDistanceToNursery(sw);
+                if (d < minDist) { minDist = sw ? d : minDist; minWord = sw; }
+                if (d < (uintptr_t(4) << 30))   ++near4G;
+                if (d < (uintptr_t(256) << 20)) ++near256M;
+                if (d < (uintptr_t(1) << 20))   ++near1M;
+            }
+        }
+        std::fprintf(stderr,
+            "v3 BRUTE-NEARMISS: nursery young=[%p,%p)  scalarWords=%zu  "
+            "closest={word=%p dist=%zuB}  within[4G=%zu 256M=%zu 1M=%zu]\n",
+            (void*)n.youngLo(), (void*)n.youngHi(), scalarWords,
+            (void*)minWord, (size_t)(minDist == ~uintptr_t(0) ? 0 : minDist),
+            near4G, near256M, near1M);
+    }
+    // Continue to report the combined "tenured words" count — but
+    // ONLY when hitsLive > 0 (live hits are the actionable signal).
+    // Dead-only hits get a separate one-line summary so users know
+    // the brute scan ran and how much arena bloat is present.
+    size_t hits = hitsLive;
+    std::fprintf(stderr,
+        "v3 SCAVENGE BRUTE: %zu tenured words point into nursery "
+        "(first %zu dumped above)\n", hits, std::min(hits, cap));
+    if (hitsScalarFalsePos > 0) {
+        // #34: raw-word hits landing in provably-NON-POINTER scalar slots
+        // (a Bindings entry's {SymbolId,PosIdx32}, a header count, etc.) whose
+        // 64-bit value coincidentally fell in the nursery's ASLR range.  Not a
+        // missed root (no pointer lives there) — filtered from the count above.
+        std::fprintf(stderr,
+            "v3 SCAVENGE BRUTE: %zu scalar-slot words coincided with the "
+            "nursery range — FILTERED (non-pointer metadata, not a missed "
+            "root; see #34 RCA)\n", hitsScalarFalsePos);
+    }
+    if (hitsDead > 0) {
+        // Dead hits = arena bloat (Boehm pins arena → dead tenured
+        // objects retain stale nursery pointers).  Informational
+        // only; future work: precise per-object arena root
+        // registration (Stage 3 Phase D adjacent).
+        std::fprintf(stderr,
+            "v3 SCAVENGE BRUTE: %zu tenured words inside DEAD "
+            "(unreachable-from-v3) tenured objects — arena-bloat, "
+            "not a missed root\n", hitsDead);
+    }
+    std::fflush(stderr);
+}
+
+} // namespace
+
+void scavengeNursery(Nursery & n, VMState & vm) noexcept
+{
+    static const bool s_dbg = std::getenv("V3_DBG_NURSERY") != nullptr;
+    static const bool s_audit = std::getenv("V3_DBG_NURSERY_AUDIT") != nullptr;
+    // #738 Phase E v0.1: always capture pre-scavenge used bytes so
+    // `recordSurvival` can compute `diedBytes = preUsed - bytesSurvived`.
+    Nursery::Stats pre = n.stats();
+    ScavengeBuffers & buf = threadScavengeBuffers();
+    buf.clear();
+    Scavenger sc{n, vm, buf.forward, buf.walked, buf.graylist};
+    sc.run();
+    // PhD-6 (2026-06-14): the per-chain materialize memo (value.cc s_matMemo)
+    // caches (chain -> materialised Bindings) by raw pointer and is NOT a GC
+    // root.  It is cleared at the major-GC safepoint (vm.cc:3506) for exactly
+    // the M-1 reasons (a swept/forwarded entry would be returned stale, or a
+    // freed+reused key would alias) — but under the nursery the major GC is OFF,
+    // so that clear never fires and the scavenge just MOVED the cached pointers.
+    // A later memo HIT would return a stale Bindings whose entries point at
+    // pre-move (reclaimed) nursery objects → the AUDIT "tenured Bindings.entries
+    // [N].value -> nursery" missed-root signature.  Clear here, after every
+    // scavenge, mirroring the major-GC safepoint clear (bounded cost: the memo
+    // repopulates on the next materialise — at most K copies per scavenge epoch).
+    Bindings::clearMaterializeMemo();
+    // #738 Phase E v0.1: record bytes-survived into Nursery so the
+    // process-lifetime totals are visible to run.cc's NIX_VM_STATS
+    // banner.  Cost: two adds + branch per scavenge.
+    n.recordSurvival(sc.bytesSurvived, static_cast<uint64_t>(pre.used));
+    if (__builtin_expect(s_audit, 0)) postScavengeAudit(n, vm);
+    static const bool s_brute = std::getenv("V3_DBG_NURSERY_BRUTE") != nullptr;
+    if (__builtin_expect(s_brute, 0)) {
+        // Sort the live-tenured-range list by start address so
+        // postScavengeBruteScan's binary-search lookup is well-formed.
+        std::sort(sc.liveTenuredRanges.begin(), sc.liveTenuredRanges.end(),
+                  [](const ScavLiveRange & a, const ScavLiveRange & b) { return a.lo < b.lo; });
+        postScavengeBruteScan(n, sc.liveTenuredRanges);
+    }
+    // V3_DBG_NURSERY=1 — print one line per scavenge with the
+    // forward-map size + tenured-walk size so we can verify the
+    // pass actually moved live data and how much it had to
+    // process.  Cached env-var lookup so the loop hot path stays
+    // free of getenv calls.
+    if (s_dbg) [[unlikely]] {
+        Nursery::Stats post = n.stats();
+        // #738 add per-scavenge survival numbers so the trace line
+        // matches the NIX_VM_STATS banner format.
+        const uint64_t died = (pre.used > sc.bytesSurvived)
+            ? (pre.used - sc.bytesSurvived) : 0;
+        std::fprintf(stderr,
+            "[v3 nursery] scavenge#%llu  forwarded=%zu  walked=%zu  "
+            "used-pre=%zuB/%zuB  survived=%lluB  died=%lluB  "
+            "mortality=%.1f%%\n",
+            (unsigned long long)post.scavengeCount,
+            sc.forward.size(), sc.walked.size(),
+            pre.used, pre.sizeBytes,
+            (unsigned long long)sc.bytesSurvived,
+            (unsigned long long)died,
+            pre.used > 0
+                ? (double(died) * 100.0 / double(pre.used)) : 0.0);
+    }
+}
+
+bool Nursery::maybeScavenge(VMState & vm) noexcept
+{
+    if (!scavengeEnabled || !shouldScavenge()) return false;
+    scavengeNursery(*this, vm);
+    return true;
+}
+
+bool Nursery::forceScavenge(VMState & vm) noexcept
+{
+    // STRESS bypasses the `scavengeEnabled` gate (the whole point
+    // is to force scavenges even when production users haven't
+    // opted in to NIX_V3_NURSERY_SCAVENGE=1).  Still requires the
+    // nursery itself to be `enabled` — without it there's no
+    // backing buffer to scavenge.
+    if (!enabled || !base) return false;
+    scavengeNursery(*this, vm);
+    return true;
+}
+
+} // namespace nix::v3

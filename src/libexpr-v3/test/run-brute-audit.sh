@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# v3 nursery brute / audit diagnostic regression — 2026-05-21
+#
+# Closes ACTION_PLAN_2026-05-15.md Phase 1.7 exit criterion and
+# GC_AUDIT_ROUND_2_2026-05-21.md §3.4 R1 ("highest-leverage tooling
+# investment").
+#
+# Method: run a curated battery of allocating workloads under the
+# `V3_DBG_NURSERY_BRUTE=1 V3_DBG_NURSERY_AUDIT=1` gates with a tiny
+# nursery (1 MB) so scavenges fire frequently.  After each run:
+#   - parse stderr for `v3 SCAVENGE BRUTE: N tenured words` where N>0
+#     (a tenured-arena word pointing into the nursery survived
+#     scavenge: missed root).
+#   - parse stderr for `v3 SCAVENGE AUDIT: nursery .* reachable via`
+#     (auditor's reachable-graph walk found a nursery pointer that
+#     the scavenger didn't forward).
+# Either hit → suite FAIL with the diagnostic line(s) echoed.
+#
+# Hit = missed root = Stage 3 default-on blocker.  These tests stay
+# RED until the underlying root is forwarded; they're the
+# correctness signal for "is scavenge complete?"
+#
+# Why not fold into all-v3-tests.sh `--brute` mode: the existing
+# lang / property / derivation-parity scripts pipe their command
+# output through `tail -1` etc., stripping the BRUTE / AUDIT stderr
+# lines before they reach the all-v3-tests.sh log file.  A
+# dedicated harness that captures stderr separately is the only way
+# to surface hits reliably.
+#
+# Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
+# Input Output Group.
+# SPDX-License-Identifier: Apache-2.0
+
+set -u
+
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+V3_EVAL="${V3_EVAL:-$ROOT/build/src/libexpr-v3/v3-eval}"
+NIX="${NIX:-$ROOT/build/src/nix/nix}"
+
+if [[ ! -x "$V3_EVAL" ]]; then
+    echo "brute-audit: $V3_EVAL not found, build first" >&2
+    exit 2
+fi
+
+# Optional: nixpkgs cases require the integrated nix CLI for
+# `--impure` channel resolution.  Skip those cases if `nix` isn't
+# available (i.e. running in a stripped-down test env).
+HAS_NIX=0
+if [[ -x "$NIX" ]]; then HAS_NIX=1; fi
+
+# Pin <nixpkgs> to the repo's flake.lock nixpkgs so the golden versions below
+# don't drift with each host's channel (see nixpkgs-pin.sh).  The expected
+# strings are derived from this pinned rev — re-derive them after a flake bump.
+source "$(dirname "${BASH_SOURCE[0]}")/nixpkgs-pin.sh"
+
+# Shared gates.  1 MB nursery so a 1000-iteration workload scavenges
+# many times — exposes any sticky tenured→nursery edge.
+export NIX_V3_NURSERY=1
+export NIX_V3_NURSERY_SCAVENGE=1
+export NIX_V3_NURSERY_SIZE=1
+export V3_DBG_NURSERY_BRUTE=1
+export V3_DBG_NURSERY_AUDIT=1
+
+PASS=0
+FAIL=0
+fail_names=()
+
+# run_case <name> <expected-stdout-substring> <expr>
+# Runs the v3-eval invocation, captures stdout + stderr to separate
+# temp files, then:
+#   1. Asserts the expected substring appears in stdout.
+#   2. Asserts NO BRUTE hit (`SCAVENGE BRUTE: [1-9][0-9]* tenured`)
+#      and NO AUDIT hit (`SCAVENGE AUDIT: nursery .* reachable via`)
+#      in stderr.
+# A diagnostic hit is reported with the first three matching lines
+# inline so the failure mode is obvious without opening the temp file.
+run_case() {
+    local name="$1" want="$2" expr="$3"
+    local stdout_f stderr_f
+    stdout_f="$(mktemp -t v3-brute-stdout.XXXXXX)"
+    stderr_f="$(mktemp -t v3-brute-stderr.XXXXXX)"
+    # 60 s + 2 G heap baseline.  When V3_DBG_GC_STRESS is on we bump
+    # wall-time to 300 s — scavenge-every-N-ops on a 100k-element
+    # workload fires tens of thousands of full graph walks; the
+    # increased budget covers it without masking real hangs.
+    local wall_s=60
+    if [[ -n "${V3_DBG_GC_STRESS:-}" && "${V3_DBG_GC_STRESS}" != "0" ]]; then
+        wall_s=300
+    fi
+    NIX_V3_MAX_WALL_TIME="${wall_s}s" NIX_V3_MAX_HEAP=2G \
+        "$V3_EVAL" --expr "$expr" \
+        >"$stdout_f" 2>"$stderr_f"
+    _process_case "$name" "$want" "$stdout_f" "$stderr_f" $?
+}
+
+# run_case_file <name> <expected-stdout-substring> <path>
+# Same as run_case but parses a self-contained .nix FILE (for multi-line
+# regression fixtures).  Used by the PhD-6 list-primop-barrier regression
+# (test/repro-phd6-list-primop-barriers.nix) — a fixture that hammers every
+# nursery-capable list-construction primop so the class-3 missed-root class
+# (the nursery-flip blocker, 2026-06-15) cannot silently regress.
+run_case_file() {
+    local name="$1" want="$2" path="$3"
+    if [[ ! -f "$path" ]]; then
+        echo "SKIP  $name (fixture $path not found)"
+        return 0
+    fi
+    local stdout_f stderr_f
+    stdout_f="$(mktemp -t v3-brute-file-stdout.XXXXXX)"
+    stderr_f="$(mktemp -t v3-brute-file-stderr.XXXXXX)"
+    local wall_s=60
+    if [[ -n "${V3_DBG_GC_STRESS:-}" && "${V3_DBG_GC_STRESS}" != "0" ]]; then
+        wall_s=300
+    fi
+    NIX_V3_MAX_WALL_TIME="${wall_s}s" NIX_V3_MAX_HEAP=2G \
+        "$V3_EVAL" --file "$path" \
+        >"$stdout_f" 2>"$stderr_f"
+    _process_case "$name" "$want" "$stdout_f" "$stderr_f" $?
+}
+
+# run_case_nix <name> <expected-stdout-substring> <expr>
+# Same as run_case but invokes the integrated `nix eval --impure`
+# path so nixpkgs / channel expressions resolve.  Requires
+# `NIX_V3_DIRECT_EVAL=1` to
+# bypass the TW pre-eval at the installable layer (otherwise TW
+# evaluates first and v3 doesn't see the workload).
+# Wider budget (120 s wall, 4 G heap) because nixpkgs evals
+# allocate substantially more even for `.name`.
+run_case_nix() {
+    if (( ! HAS_NIX )); then
+        echo "SKIP  $1 (nix CLI not built)"
+        return 0
+    fi
+    local name="$1" want="$2" expr="$3"
+    local stdout_f stderr_f
+    stdout_f="$(mktemp -t v3-brute-nix-stdout.XXXXXX)"
+    stderr_f="$(mktemp -t v3-brute-nix-stderr.XXXXXX)"
+    # nixpkgs workloads under STRESS need substantially more wall
+    # budget — `firefox.name` already touches ~1 GB of allocations
+    # without scavenge stress.  Scale the budget similarly to
+    # run_case above.
+    local wall_s=120
+    if [[ -n "${V3_DBG_GC_STRESS:-}" && "${V3_DBG_GC_STRESS}" != "0" ]]; then
+        wall_s=600
+    fi
+    NIX_V3_DIRECT_EVAL=1 \
+        NIX_V3_MAX_WALL_TIME="${wall_s}s" NIX_V3_MAX_HEAP=4G \
+        "$NIX" --extra-experimental-features nix-command \
+        eval --impure --expr "$expr" \
+        >"$stdout_f" 2>"$stderr_f"
+    _process_case "$name" "$want" "$stdout_f" "$stderr_f" $?
+}
+
+# Body of pass/fail accounting + diagnostic dump shared between
+# run_case (v3-eval) and run_case_nix (integrated nix CLI).
+_process_case() {
+    local name="$1" want="$2" stdout_f="$3" stderr_f="$4" rc="$5"
+    local stdout_val brute_hits audit_hits
+    stdout_val="$(cat "$stdout_f")"
+    # The LIVE hit line ends with `point into nursery`; the DEAD
+    # arena-bloat line ends with `inside DEAD ...`.  Only LIVE
+    # hits (true missed-roots in reachable objects) fail the case.
+    brute_hits="$(grep -E '^v3 SCAVENGE BRUTE: [1-9][0-9]* tenured words point into nursery' "$stderr_f" || true)"
+    audit_hits="$(grep -E '^v3 SCAVENGE AUDIT: nursery .* reachable via' "$stderr_f" || true)"
+    local case_ok=1
+    local why=""
+    if (( rc != 0 )); then
+        case_ok=0
+        why="exit=$rc"
+    elif [[ "$stdout_val" != *"$want"* ]]; then
+        case_ok=0
+        why="want='$want' got='$stdout_val'"
+    elif [[ -n "$brute_hits" ]]; then
+        case_ok=0
+        why="BRUTE hit"
+    elif [[ -n "$audit_hits" ]]; then
+        case_ok=0
+        why="AUDIT hit"
+    fi
+    if (( case_ok )); then
+        PASS=$((PASS + 1))
+        echo "OK    $name"
+    else
+        FAIL=$((FAIL + 1))
+        fail_names+=("$name [$why]")
+        echo "FAIL  $name [$why]"
+        if [[ -n "$brute_hits" ]]; then
+            echo "$brute_hits" | head -3 | sed 's/^/      /'
+        fi
+        if [[ -n "$audit_hits" ]]; then
+            echo "$audit_hits" | head -3 | sed 's/^/      /'
+        fi
+    fi
+    rm -f "$stdout_f" "$stderr_f"
+}
+
+# ---------- workloads ----------
+#
+# Each workload is sized so the 1 MB nursery cycles through several
+# scavenges during eval — small enough that the suite stays under a
+# minute total, large enough that scavenge actually fires.  The
+# expected-stdout-substring is matched permissively (substring) so
+# leading diagnostic lines on stdout don't break the assertion.
+
+# 1) Small arithmetic + let-rec — sanity baseline.  Same workloads
+#    that p1 of run-nursery-tests already validates for correctness;
+#    here we also assert no diagnostic hit.
+run_case "arith"        "3"      '1 + 2'
+run_case "let-square"   "25"     'let x = 5; in x * x'
+run_case "lambda-apply" "42"     'let f = x: x + 1; in f 41'
+run_case "attrs-select" "2"      '{ a = 1; b = 2; c = 3; }.b'
+
+# 2) Fix-point eval — exercises tenured Bindings + Closure capture.
+run_case "fix-point"    "2"      'let lib = { fix = f: let x = f x; in x; }; in (lib.fix (self: { x = 1; y = self.x + 1; })).y'
+
+# 3) Tail recursion — forces many scavenges through the dispatch loop.
+run_case "tail-1000"    "0"      'let f = x: if x == 0 then 0 else f (x - 1); in f 1000'
+
+# 4) genList + foldl' — known to trip BRUTE on the open missed-root
+#    finding discovered 2026-05-21 during initial wiring.  Sized to
+#    match nursery-tests' p8 (100000 elements) which exhibits the
+#    bug consistently with ~2300+ BRUTE hits per scavenge.
+run_case "fold-genlist-100k" "4999950000" 'builtins.foldl'"'"' (a: b: a + b) 0 (builtins.genList (i: i) 100000)'
+
+# 5) Smaller fold to confirm threshold — genList 5000 still hits,
+#    1000 does not (per initial measurement).  Both included so a
+#    future regression that pulls the threshold down to 1000 is
+#    caught immediately.
+run_case "fold-genlist-5k"   "12497500"   'builtins.foldl'"'"' (a: b: a + b) 0 (builtins.genList (i: i) 5000)'
+run_case "fold-genlist-1k"   "499500"     'builtins.foldl'"'"' (a: b: a + b) 0 (builtins.genList (i: i) 1000)'
+
+# 6) Deep let-rec / fix combination — p7 from run-nursery-tests, but
+#    here we also assert no diagnostic hit.
+run_case "deep-let-rec-fix" "28000" '
+  let
+    rec1 = self: { a = 1; b = 2; c = self.a + self.b;
+                   d = self.c * 2; e = self.d + self.a; };
+    fix = f: let x = f x; in x;
+    deep = n: if n == 0 then 0
+              else (fix rec1).e + deep (n - 1);
+  in deep 4000'
+
+# 7) nixpkgs slice — real-world workloads that exercise the integrated
+#    nix CLI + treeWalkerToV3 bridge + bytecode-installed primops +
+#    derivationStrict.  These are the canonical "is v3 default-on
+#    safe?" workloads; a BRUTE hit here means the bug shows up under
+#    actual user-facing eval.
+#
+#    Sized intentionally small.  hello.name is the warm-eval baseline.
+#    hello.drvPath exercises derivationStrict + outPath caching.
+#    firefox.name exercises a substantially larger transitive eval
+#    (qt5-packages + GTK + Rust toolchain) to surface anything that
+#    only triggers under nixpkgs-scale pressure.
+# Golden versions are pinned to flake.lock's nixpkgs (nixpkgs-pin.sh) — bump =
+# `nix flake update nixpkgs` THEN re-derive these by eval against the new rev.
+run_case_nix "hello-name"     "hello-2.12.2"               '(import <nixpkgs> { }).hello.name'
+run_case_nix "hello-drvPath"  "hello-2.12.2.drv"           '(import <nixpkgs> { }).hello.drvPath'
+run_case_nix "hello-outPath"  "hello-2.12.2"               '(import <nixpkgs> { }).hello.outPath'
+run_case_nix "gcc-name"       "gcc-wrapper"                '(import <nixpkgs> { }).gcc.name'
+run_case_nix "firefox-name"   "firefox-148.0"              '(import <nixpkgs> { }).firefox.name'
+
+# 8) PhD-6 regression — the nursery-flip blocker (2026-06-15).  git.drvPath is
+#    the workload that exposed the unbarriered primZipAttrsWith list
+#    construction (7 missed roots: "nursery Thunk reachable via ListVec.elems[]")
+#    that hello/firefox did NOT hit.  Keep it standing so the class-3
+#    list-construction barrier coverage cannot silently regress.
+run_case_nix "git-drvPath"    "git-2.51.2.drv"             '(import <nixpkgs> { }).git.drvPath'
+
+# 9) PhD-6 synthetic — deterministically hammers EVERY swept list-construction
+#    primop (zipAttrsWith/attrValues/concatLists/filter/concatMap/partition/
+#    catAttrs/genericClosure/split/groupBy/fromJSON) under the 1 MB nursery, so
+#    a future omission of listPostConstructBarrier at any of them is caught here
+#    without needing a nixpkgs package that happens to exercise it.
+run_case_file "list-primop-barriers" "ok" \
+    "$ROOT/src/libexpr-v3/test/repro-phd6-list-primop-barriers.nix"
+
+echo
+echo "=== brute-audit: ok=$PASS fail=$FAIL ==="
+if (( FAIL > 0 )); then
+    echo "FAILED CASES:"
+    for n in "${fail_names[@]}"; do echo "  - $n"; done
+    echo
+    echo "A BRUTE hit means a tenured arena word holds a nursery pointer"
+    echo "that scavenge didn't forward — a missed-root in the scavenger."
+    echo "Investigate: identify the object class at the hit address, the"
+    echo "field within it, and add the corresponding walk in gc.cc."
+    echo
+    echo "An AUDIT hit means the post-scavenge reachable-graph walk"
+    echo "(\`postScavengeAudit\`) found a nursery pointer reachable from"
+    echo "a known root — usually a missed walk in one of the per-type"
+    echo "scavenger walkers (walkClosure, walkThunk, walkBindings,"
+    echo "walkList, walkPair) or in the run() root-set."
+    exit 1
+fi
+exit 0

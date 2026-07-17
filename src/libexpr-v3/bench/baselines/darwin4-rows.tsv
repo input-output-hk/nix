@@ -1,0 +1,197 @@
+# darwin-4 canonical CPU baselines — the QUIET host (aarch64-darwin-4.lan, load ~1.1).
+# min-of-5, cache-off (NIX_V3_NO_DISK_CACHE=1), user CPU seconds, byte-identical drvPaths.
+# THE MEASUREMENT OF RECORD for CPU. The laptop is UNUSABLE for CPU levers: its
+# ~5-10% noise floor exceeds the 3% keep-bar (proven 2026-06-19 — the attr-select
+# IC measured −8% on the laptop at min-of-3 and REVERSED to +6% at min-of-5; on
+# darwin-4 it is exactly 0.0%). All CPU grading MUST run here.
+#
+# CONVENTION (2026-06-20): every row is STAMPED with the commit it was measured
+# at (last column) + the date.  Re-measure + re-stamp after any change that could
+# move the eval hot path; a row whose `commit` is an ancestor of HEAD is STALE.
+# The same numbers are also attached to the tested commit as a `git notes`
+# (refs/notes/commits) entry — see `git notes show <commit>`.
+#
+# Key finding: the true v3-vs-TW gap is ~4.4-5.5× (LARGER + more uniform than the
+# laptop's noisy 3.44×), byte-identical, and lives in the CORE EVAL LOOP
+# (forceValue #1 leaf + callClosure + dispatchLoop) — systemic interpreter cost,
+# not a hot-spot. See lode/V3_VS_TW_STRUCTURAL_ANALYSIS_2026-06-19.md.
+#
+# nixpkgs on darwin-4: hello-2.12.3, git-2.50.1, firefox-146.0.1; absolute times
+# are darwin-4-specific — use for v3-vs-v3 A/Bs + the ratio, not cross-host compare.
+# arena = NIX_V3_DIRECT_EVAL=1 NIX_VM_STATS=1 v3_arena MB (1 run; deterministic).
+#
+# 20758fad5 = colleague's env-sharing+interning+mapAttrs/force stack (default-on)
+#   + this session's #60-66 (POS-3 fix, evac dedup, docs).  vs the 3ff650587 base
+#   (pre-stack): CPU-NEUTRAL — hello 4.73 (=), git 4.42→4.45, firefox 5.45→5.50
+#   (both within darwin-4 noise) → the whole stack did NOT regress raw eval CPU.
+#
+# row	v3_cpu	tw_cpu	ratio	arena_MB	impure	cache	commit	date
+# PINNED nixpkgs (7e6cc3534, test/nixpkgs-pin.sh = flake.lock rev e764fc9a):
+# hello/git/firefox rows below are now the pinned workloads (hello-2.12.2 /
+# git-2.51.2 / firefox-148.0), memo-on (L1 55ba50216) — reproducible on ANY host
+# (no more channel drift; firefox was 5.50/5.00/3.62 by channel version).
+# These SUPERSEDE the channel-measured rows; absolute numbers differ because the
+# package versions differ (e.g. firefox-148.0 evals cheaper than channel 146.0.1).
+hello	1.21	0.27	4.48	83.9	yes	off	7e6cc3534	2026-06-22
+git	1.41	0.34	4.15	117.4	yes	off	7e6cc3534	2026-06-22
+firefox	2.64	0.73	3.62	352.3	yes	off	7e6cc3534	2026-06-22
+# big-workload rows (IFD built locally on aarch64-darwin; min-of-3 for M5 cost,
+# min-of-5 for HNE). peak_rss: M5 3122MB (thunks 637MB dominant), HNE ~2055MB.
+# RATIO TIGHTENS WITH SCALE: small ~4.4-5.5x -> HNE 4.92x (453MB) -> M5 3.18x (1543MB).
+HNE	6.81	1.54	4.42	453.0	yes	off	55ba50216	2026-06-21
+M5	10.86	3.57	3.04	1543.5	yes	off	55ba50216	2026-06-21
+# WARM (cache-on, production) rows — the disk cache amortizes parse+lower, so
+# these are the STEADY-STATE dev-loop CPU.  ~1/3-1/2 of the cache-off gap is the
+# amortizable lowering tax.  cache=warm.  THE PRODUCTION METRIC (track alongside
+# cache-off which stays the correctness/cold oracle).  Pinned nixpkgs, memo-on.
+hello	0.53	0.27	1.96	83.9	yes	warm	7e6cc3534	2026-06-22
+git	0.71	0.34	2.09	117.4	yes	warm	7e6cc3534	2026-06-22
+firefox	1.78	0.73	2.44	352.3	yes	warm	7e6cc3534	2026-06-22
+HNE	2.66	1.54	1.73	453.0	yes	warm	7e6cc3534	2026-06-22
+M5	6.45	3.60	1.79	1543.5	yes	warm	7e6cc3534	2026-06-22
+# ============================================================================
+# P0.4 RE-BASELINE (2026-07-02, commit 2d7efdb97) — AUTHORITATIVE post-WS-0
+# de-instrumentation baseline (v3_release=false, the shipped config).  These
+# SUPERSEDE the 7e6cc3534 firefox/M5 rows above.  Measured by beat-tw-compare.sh
+# (median-of-5, back-to-back TW-vs-v3).  NB: the 5th column here is peak_RSS MB
+# (NOT arena — beat-tw-compare skips NIX_VM_STATS to avoid its teardown-GC RSS
+# perturbation).  P0.1a (primop-counter gating) shaved a small slice off the
+# DEFAULT build: firefox warm 2.49->2.43x, cold 3.68->3.62x; M5 cold v3
+# 11.10->10.96s.  The larger P0.1b/c de-instrumentation win needs
+# -Dv3_release=true (see the P0.2 A/B rows below).
+# row	v3_cpu	tw_cpu	ratio	peakRSS_MB	impure	cache	commit	date
+firefox	2.68	0.74	3.62	677	yes	off	2d7efdb97	2026-07-02
+M5	10.96	3.60	3.04	2950	yes	off	2d7efdb97	2026-07-02
+firefox	1.80	0.74	2.43	586	yes	warm	2d7efdb97	2026-07-02
+M5	6.54	3.61	1.81	2217	yes	warm	2d7efdb97	2026-07-02
+# P0.3 FALSIFIER (2026-07-02, 2d7efdb97): firefox user-CPU median-of-5,
+#   caps UNSET=2.68s  vs  caps SET(NIX_V3_MAX_WALL/HEAP/CPU)=2.69s  => +0.4%
+#   (noise).  EXIT CRITERION MET: probe-config CPU == default-config CPU.  The
+#   CLAUDE.md-mandated NIX_V3_MAX_* probe vars no longer inflate timing.
+# P0.2 A2 FALSIFIER (2026-07-02, 2d7efdb97): -Dv3_release=true A/B vs the
+#   v3_release=false rows above.  Pre-committed bar: ship if >=2% wall OR
+#   >=20MB RSS reduction.  RESULT = NO-GO (within noise, marginally WORSE):
+#     firefox cold  release 2.69s/679MB  vs false 2.68s/677MB  (+0.4% / +2MB)
+#     M5      cold  release 11.07s/3005MB vs false 10.96s/2950MB (+1.0% / +55MB)
+#     firefox warm  release 1.81s/586MB  vs false 1.80s/586MB  (~0)
+#     M5      warm  release 6.53s/2218MB vs false 6.54s/2217MB (~0)
+#   => KEEP v3_release=false.  The audit §1.2 "instrumentation tax" hypothesis
+#   is FALSIFIED for the V3_STATS counters: the only MATERIAL instrumentation
+#   was the primop counter (mutex+string+map), already gated by P0.1a in the
+#   default build; the residual per-alloc/histogram/fastpath counters are
+#   noise-level, so stripping them (v3_release=true) buys nothing.
+# ============================================================================
+# WS-1 + P3.4 VALIDATION (2026-07-02, commit 4a7055a22 = HEAD after P1.1/1.2/1.3
+# + P2.1-measure + P3.4).  Aggregate CPU/RSS vs the 2d7efdb97 P0.4 baseline
+# above.  RESULT: WS-1 correctness fixes are COST-FREE (no regression); P3.4
+# (valueEqual per-compare malloc-avoidance) is a small net win, most visible on
+# compare-heavy M5 warm.  5th column = peak_RSS MB (beat-tw-compare).
+# row	v3_cpu	tw_cpu	ratio	peakRSS_MB	impure	cache	commit	date
+firefox	2.66	0.74	3.59	678	yes	off	4a7055a22	2026-07-02
+M5	10.84	3.60	3.01	2996	yes	off	4a7055a22	2026-07-02
+firefox	1.79	0.74	2.42	586	yes	warm	4a7055a22	2026-07-02
+M5	6.40	3.60	1.78	2217	yes	warm	4a7055a22	2026-07-02
+#   vs P0.4 (2d7efdb97): ff cold 2.68->2.66 (-0.7%), M5 cold 10.96->10.84
+#   (-1.1%), ff warm 1.80->1.79 (-0.6%), M5 warm 6.54->6.40 (-2.1%).
+# ============================================================================
+# WS-3 CUMULATIVE VALIDATION + P4.4 FALSIFIER (2026-07-02, commit 362f87be9 =
+# HEAD after the full shipped WS-3 batch: §3.14 dead-code (803b0af11), P3.3
+# FALSIFIED+reverted (152c6605f), P3.5 constexpr phaseDActive + P3.8 std::move
+# (362f87be9); on top of WS-1 + P3.2/P3.4/P3.5a already in 4a7055a22).
+# 5th column = peak_RSS MB (beat-tw-compare median-of-5).
+# row	v3_cpu	tw_cpu	ratio	peakRSS_MB	impure	cache	commit	date
+firefox	2.67	0.73	3.66	679	yes	off	362f87be9	2026-07-02
+firefox	1.79	0.73	2.45	586	yes	warm	362f87be9	2026-07-02
+#   vs P0.4 (2d7efdb97): ff cold 2.68->2.67 (NEUTRAL), ff warm 1.80->1.79
+#   (NEUTRAL).  RESULT: the entire shipped WS-3 batch (correctness P1.1-1.4 +
+#   the P3.2/P3.4/P3.5a/§3.14/P3.5-constexpr/P3.8 micro-opts) is CPU-NEUTRAL /
+#   cost-free at firefox scale — no regression, no material win (each micro-op
+#   is individually noise-level, as the beat-tw campaign predicted).  The value
+#   of WS-1 is CORRECTNESS (TW-parity + a PhD-6 UAF barrier), not CPU.
+# ---------------------------------------------------------------------------
+# P4.4 step-0 FALSIFIER (§5.6 string-context re-parse; V3_DBG_CTX_PARSE_MEMO=1):
+#   firefox COLD (drvPath, drv-heavy) user-CPU median-of-5:
+#     memo-OFF (default) = 2.67s   vs   memo-ON = 2.66s   =>  -0.4% (NOISE).
+#   Pre-committed bar: firefox CPU drop >=3% => fund the interned-context lever
+#   1.1.  RESULT = FALSIFIED (NO-GO for CPU): the per-drv context re-parse
+#   (NixStringContextElem::parse) is NOT a material CPU cost — memoizing it buys
+#   nothing.  The cost, if any, is in the token COPIES (a MALLOC_SMALL/RSS
+#   concern the beat-tw campaign already graded modest/foundational), not the
+#   parse-back.  Lever 1.1 stays UNFUNDED for CPU; the RSS/span-sharing angle is
+#   a separate deferred W-scale item.  firefox.drvPath is a valid drv-heavy
+#   proxy (full inputDrvs context); M5 (more drv-heavy) is IFD-blocked on
+#   aarch64 but the firefox null result already refutes the CPU hypothesis.
+# ============================================================================
+# synthetic v3-only rows below NOT re-measured at 20758fad5 — last at 3ff650587:
+fib	2.29	NA	NA	NA	no	off	3ff650587	2026-06-19
+attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
+# foldl: pending (ssh-quoting of the foldl' apostrophe; synthetic row, low priority)
+# M5/cardano/HNE: IFD-blocked on aarch64 (cardano-node needs x86_64-linux IFD);
+#   big-workload CPU+peak-RSS remain UNMEASURED until an x86_64-linux host builds.
+# ============================================================================
+# P3.1 chain-aware read IC A/B (2026-07-02, commit 0cb2f88b5, NIX_V3_CHAIN_IC):
+#   firefox.drvPath cold: gate-OFF 2.66s == gate-ON 2.66s  => 0% (no win)
+#   git.drvPath     cold: gate-OFF 1.41s == gate-ON 1.41s  => 0% (no win)
+#   VERDICT: NO measurable CPU win on the measurable SELECT workloads — real
+#   nixpkgs // chains are shallow (SELECT short-circuits at the first matching
+#   layer), so §3.2's "walks all ≤16 layers" is overstated for firefox/git and
+#   the IC lookup+validation ~= the shallow walk it replaces.  M5 (the audit's
+#   named deep-chain target) is IFD-blocked on aarch64 => unmeasured.  Kept
+#   GATED default-off (validated, zero prod risk); flip decision awaits an
+#   x86_64 M5 A/B + a per-site chain-SELECT hit-rate counter (DELETE if M5 also
+#   ~0%).  Another measure-first "headline lever doesn't materialize" result.
+#   --- FOLLOW-UP (same day): a chain-SELECT depth/hit-rate counter settled it ---
+#   firefox.drvPath: chain-SELECTs = 60.4% of 511776 selects (COMMON, not rare),
+#     gate-off avg chain depth = 2.44 layers (SHALLOW), gate-on IC hit-rate 45.9%.
+#   git.drvPath:     57.5% of selects, avg depth 2.35, IC hit-rate 44.9%.
+#   => The IC fires + hits ~45% but each hit saves only a ~2.4-hop walk over small
+#      overlays ~= the IC's own 4-way scan+validate => STRUCTURAL WASH => 0% CPU.
+#      §3.2's "walks all <=16 layers" refuted (mergeBindings flattens every 16 +
+#      SELECTs short-circuit at the top overlay => effective depth ~2.4).  For M5
+#      to win, avg depth would need >>4 (contradicted by the flatten-cap).
+#   VERDICT: DELETED per Rule 0 (no-win gate retires).  Validated design preserved
+#   at commit 0cb2f88b5; re-apply only if a future x86_64 M5 depth probe shows >>4.
+# ============================================================================
+# P2.1-a OP_RAW_FORMAL A/B (2026-07-03, commit d035e71f7, NIX_V3_RAW_FORMALS):
+#   firefox COLD: gate-OFF 2.66s / 679MB  vs  gate-ON 2.66s / 680MB  => 0% CPU,
+#   ~0 RSS (noise).  BUT gate-ON eliminates 31,636 wrapper thunk allocs
+#   (313787->282151, -10% of wrappers, ~24.5K never-forced waste; total
+#   descriptor thunks 12.79%->11.65%) — byte-identical (hello/git/firefox/python3
+#   drvPath) + --brute 28/28 gate-on & off + adversarial NOT-REFUTED.
+#   VERDICT: 0% measurable CPU/RSS at firefox scale (the alloc drop is real but
+#   ~0.76MB, sub-noise).  UNLIKE the chain-IC (pure wash, deleted), this removes
+#   REAL allocations that SCALE with thunk count — and thunks are M5's DOMINANT
+#   RSS (637MB, IFD-blocked/unmeasured on aarch64).  Kept GATED default-off; flip
+#   decision awaits an x86_64 M5 peak-RSS A/B (flip if the wrapper-alloc cut
+#   lowers M5 RSS materially; else retire).  Relaxing the nUp==1/nWiths==0 guard
+#   (with-scoped wrappers) would capture more — bounded follow-up.
+# ============================================================================
+# M5 A/B on darwin-4 (2026-07-03, commit e3daf70c3 + depth counter; M5 IS
+# measurable here — flake ~/Projects/iohk/cardano-node, .cardano-node.name,
+# cache-off, NIX_V3_MAX_HEAP=16G; byte-id value cardano-node-exe-cardano-node-11.0.1):
+#   P3.1 chain-SELECT depth probe: chain=2,105,571 (24.7% of 8,525,736 selects)
+#     avgDepth=1.99 | flat=6,420,165.  => M5 chains are SHALLOW (1.99, even
+#     shallower than firefox/git ~2.4) and chain-SELECTs are a MINORITY (24.7%).
+#     The chain-IC would be a WASH on M5 too — the M5-deep-chain hypothesis is
+#     FALSIFIED.  P3.1 chain-IC CONFIRMED DELETED everywhere (0cb2f88b5 archived).
+#   P2.1-a OP_RAW_FORMAL (NIX_V3_RAW_FORMALS): peak RSS gate-OFF 2322MB vs gate-ON
+#     2324MB = +1.9MB (noise); byte-id value.  NO M5 RSS win.  (The wrapper
+#     counters read 0 on M5 — dumpFormalWrapperStats walks importCache, blind to
+#     M5's flake-eval CUs — so firing is unconfirmable via counters, but the clean
+#     peak-RSS signal is conclusive.)  Combined with firefox (0% CPU, negligible
+#     RSS), P2.1-a has NO measurable CPU/RSS win on any measurable workload =>
+#     do NOT flip default-on.  Kept gated as a correct, validated, zero-risk
+#     churn-reduction opt-in (removes ~24.5K never-forced-waste wrapper allocs on
+#     firefox); retire-eligible if no future default-on alloc-reduction program.
+# ============================================================================
+# ============================================================================
+# 2026-07-04 task #5 refresh @ e156a9874 (post defect-audit + LEVER-1 cache
+# commit; cache DEFAULT-OFF so rows are cache-agnostic).  beat-tw-compare.sh
+# median-of-5 back-to-back, user+sys CPU, peak RSS.  Cold = cache-off
+# methodology; warm = WARM=1 (CU disk cache warm, production steady state).
+# Full block git-noted on e156a9874.  RSS MB in arena_MB column position is
+# PEAK RSS here (not arena) — see the git note for the full table.
+firefox	2.60	0.73	3.56	675	yes	off	e156a9874	2026-07-04
+M5	10.74	3.59	2.99	3011	yes	off	e156a9874	2026-07-04
+firefox	1.74	0.73	2.38	590	yes	warm	e156a9874	2026-07-04
+M5	6.38	3.59	1.78	2245	yes	warm	e156a9874	2026-07-04

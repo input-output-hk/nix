@@ -1,0 +1,2474 @@
+/// @file
+/// v3 root-expression entry point implementation.
+///
+/// Mirrors the pipeline open-coded in `cli/v3-eval.cc:430-438`.  Lifted
+/// to a shared helper so the integrated `nix` CLI can use the same
+/// path under v3-direct (inversion phase 1).
+///
+/// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
+/// SPDX-License-Identifier: Apache-2.0
+
+#include "v3/run.hh"
+#include "v3/vm.hh"
+#include "v3/primop.hh"
+#include "v3/ir.hh"
+#include "v3/alloc.hh"
+#include "v3/bytecode_primops.hh"
+#include "v3/import_timing.hh"  // #769 per-import phase totals
+#include "v3/disk_cache.hh"     // #770 cache-hit/miss stats dump
+#include "v3/aot_cache.hh"      // WS5-B2 eager canonical-table adoption
+#include "v3/cache_probe.hh"    // #827 / A3 per-call-site cache-hook dump
+#include "v3/precise_root.hh"   // 2026-05-27 Stage 3: dumpAllV3Roots diagnostic
+#include "v3/live_trace.hh"     // 2026-05-27 Stage 6 SPIKE: live-fraction trace
+#include "v3/par_trace.hh"      // parallel-potential (work/span) trace instrument
+#include "v3/forcerate_trace.hh" // per-creation-site force-rate histogram instrument
+#include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
+#include "v3/disasm.hh"         // #778 opcount dumper — opName()
+#include "v3/bytecode.hh"
+#include "v3/serialize.hh"      // #777b deserialize per-section timing
+#include "v3/value_serialize.hh" // #741 Phase 1 round-trip stats dump
+#include "v3/limits.hh"
+#include "v3/nursery.hh"
+#include "v3/barrier.hh"
+
+#include "v3/ffi.hh"  // ffi::symbols/positions + EvalState fwd — no direct eval.hh
+
+#include "v3/gc-config.hh"  // NIX_USE_BOEHMGC (v3-owned indirection)
+
+// PARSER_PROJECT_PLAN §5.3: the native parse+lower+run entry, so the
+// `nix` binary's CLI (src/nix/eval.cc) needn't pull parser/cli headers.
+#include "v3-parse-api.hh"   // nix::v3::parser::parseString
+#include "lower_v3.hh"       // canLowerV3 + lowerV3Ast
+#include "v3/tw_baseenv.hh"  // twBaseEnvGlobals
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>          // A1: top-level manifest loader (read manifest file)
+#include <sstream>          // A1: manifest content read into a string buffer
+#include <string>
+#include <string_view>      // A3: static getFlake literal-ref extraction
+#include <vector>           // A3: extracted refs + resolved lock bytes
+#include <cstring>          // A3: token-scan helpers
+#include <unordered_set>    // A1: manifest membership set
+#include <sys/resource.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>   // M1.D: malloc_zone_pressure_relief
+#include <mach/mach.h>       // M1.D: task_info TASK_VM_INFO phys_footprint (current RSS)
+#endif
+#if NIX_USE_BOEHMGC
+#include <gc/gc.h>
+#endif
+
+namespace nix::v3 {
+
+namespace {
+
+/// Phase-timing helper: present iff `V3_TIMING` env var is set.  We
+/// cache the env-var lookup once per process via a static-const-bool;
+/// mirrors the pattern used throughout vm.cc / primops.cc for
+/// hot-path env-var checks (see #538 follow-ups).
+struct PhaseTimer {
+    using Clock = std::chrono::steady_clock;
+    using TP = Clock::time_point;
+    bool active;
+    TP start;
+    double lower_ms = 0, compile_ms = 0, optimise_ms = 0, run_ms = 0;
+    explicit PhaseTimer() : active(s_active())
+    {
+        if (active) start = Clock::now();
+    }
+    void mark(double & accum)
+    {
+        if (!active) return;
+        TP now = Clock::now();
+        accum += std::chrono::duration<double, std::milli>(now - start).count();
+        start = now;
+    }
+    ~PhaseTimer()
+    {
+        if (!active) return;
+        // (bridge timing/telemetry retired — TW_VALUE_ERADICATION F4,
+        //  2026-06-02; the bridge executes nowhere, so vm == run.)
+        std::fprintf(stderr,
+            "v3-direct timing (ms): lower=%.3f optimise=%.3f compile=%.3f "
+            "run=%.3f\n",
+            lower_ms, optimise_ms, compile_ms, run_ms);
+        // #769: per-import phase breakdown — splits the outer `run`
+        // bucket into work done inside primImport recursions.  Cheap
+        // (a handful of uint64_t accumulators bumped under the V3_TIMING
+        // gate).
+        const auto & it = importTimingTotals();
+        if (it.calls + it.resultCacheHits + it.contentCacheHits + it.diskCacheHits
+                + it.nativeLowered + it.nativeBridged > 0) {
+            std::fprintf(stderr,
+                "v3-direct import timing (ms): calls=%llu (compile %.3f, miss path) | "
+                "nativeLower=%llu bridged=%llu | "
+                "cacheHits result=%llu content=%llu disk=%llu | "
+                "parse=%.3f lower=%.3f optimise=%.3f compile=%.3f "
+                "run=%.3f keyCompute=%.3f diskLookup=%.3f deserialize=%.3f diskInsert=%.3f\n",
+                (unsigned long long)it.calls,
+                (it.parseNs + it.lowerNs + it.optimiseNs + it.compileNs) / 1e6,
+                (unsigned long long)it.nativeLowered,
+                (unsigned long long)it.nativeBridged,
+                (unsigned long long)it.resultCacheHits,
+                (unsigned long long)it.contentCacheHits,
+                (unsigned long long)it.diskCacheHits,
+                it.parseNs    / 1e6,
+                it.lowerNs    / 1e6,
+                it.optimiseNs / 1e6,
+                it.compileNs  / 1e6,
+                it.runNs      / 1e6,
+                it.keyComputeNs / 1e6,
+                it.diskLookupNs / 1e6,
+                it.deserializeNs / 1e6,
+                it.diskInsertNs / 1e6);
+        }
+    }
+private:
+    static bool s_active()
+    {
+        static const bool v = std::getenv("V3_TIMING") != nullptr;
+        return v;
+    }
+};
+
+} // anonymous namespace
+
+/// Force-link the v3 library.  Called once from `mainWrapped` so the
+/// linker's `-dead_strip_dylibs` pass keeps libnixexprv3 in the
+/// binary.  No side effects.
+bool keepLibAlive()
+{
+    return true;
+}
+
+// Forward decl (defined in the anonymous namespace before
+// runRootExprFromString): the top-level result cache v1 shadow stats dump,
+// called from runRootExprModule's end-of-eval stats region below.
+namespace { void dumpTopLevelCacheStats() noexcept; }
+
+RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
+{
+    // Idempotent: register the builtin primop table on first call.
+    // Safe to call per-invocation — the underlying registry is global
+    // and de-duplicates by name.  The registration cost is constant
+    // (one-time map fill) so per-call overhead is negligible.
+    registerBuiltinPrimOps();
+
+    // #741 Phase 5b (2026-05-23): a per-eval `EvalResultBatchGuard`
+    // wrapped this body in `disk_cache::beginEvalResultBatch` /
+    // `commitEvalResultBatch` to amortise the ~1 ms / insert commit
+    // cost over a single COMMIT.  REMOVED — hyperfine measurement:
+    //   COLD ACTIVE+DISK (unbatched): 1429 ms ± 31 ms
+    //   COLD ACTIVE+DISK (batched):   1666 ms ± 764 ms
+    // Variance ballooned by 24× and the mean got WORSE, not better.
+    // Hypothesised cause: long-held transaction with ~256 KB of
+    // pending WAL data triggers SQLite's checkpoint behavior at
+    // COMMIT in non-deterministic ways (interaction with APFS /
+    // page-cache flushes).  The `disk_cache::beginEvalResultBatch` /
+    // `commitEvalResultBatch` helpers ARE kept in the disk_cache
+    // namespace as gated infrastructure (no callers in production)
+    // for future iteration — try smaller batches (e.g. every 50
+    // inserts) or explicit `PRAGMA wal_autocheckpoint=0` tuning.
+
+    // Wire the global tlNixEvalState pointer so v3 primops that need
+    // to reach back into TW (e.g. `import`, derivation strict-merge,
+    // store-side path operations) can find it.  Caller is responsible
+    // for keeping `state` alive for the lifetime of any returned Bridge
+    // thunks; see `primops.cc treeWalkerToV3` nFunction case for the
+    // address-stability contract.
+    setNixEvalState(&state);
+
+    // Phase 1.6 — initialise resource limits.  Idempotent across
+    // subsequent runRootExpr calls.  Reads NIX_V3_MAX_HEAP /
+    // NIX_V3_MAX_CPU_TIME / NIX_V3_MAX_WALL_TIME and installs the
+    // Boehm OOM handler if heap cap is set.  Cheap (one mutex + a
+    // boolean check) when re-entered.
+    initLimits();
+
+    // A12b T0: install bytecode replacements for callback primops
+    // (foldl' / map / filter / etc.) once per process.  The install
+    // itself runs runRootExpr recursively to compile each primop's
+    // Nix source; the function has its own thread-local guard that
+    // short-circuits on recursive entry so we don't loop.  Disable
+    // with NIX_V3_NO_BYTECODE_PRIMOPS=1 for A/B comparison.
+    static const bool s_noBytecodePrimops =
+        std::getenv("NIX_V3_NO_BYTECODE_PRIMOPS") != nullptr;
+    if (!s_noBytecodePrimops)
+        installAllBytecodePrimops(state);
+
+    // V3_TIMING phase split — capture lower / compile / run / bridge
+    // phase durations so bench harnesses can attribute time.  A no-op
+    // (zero overhead) when V3_TIMING is unset.
+    PhaseTimer pt;
+
+    // DIAG-4 (2026-05-29 evening, per DIAGNOSTIC_AUDIT §6.4 + user
+    // directive on "elsewhere is ominous"): per-phase ALLOCATION
+    // accounting.  Captures arena.bytesAllocated() + per-Tag byte
+    // totals at each phase boundary so we can attribute v3 arena
+    // growth to lower/optimise/compile/run.
+    //
+    // No per-allocator modification needed — snapshots at boundaries
+    // give us delta per phase.  Cost: 6 × small struct copy.
+    //
+    // Dumped under NIX_VM_STATS at the end of runRootExpr.
+    struct PhaseAllocSnap {
+        size_t arenaBytes;
+        uint64_t bytesValues;
+        uint64_t bytesClosures;
+        uint64_t bytesThunks;
+        uint64_t bytesBindings;
+        uint64_t bytesLists;
+        uint64_t bytesPairs;
+        uint64_t bytesChars;
+        uint64_t bytesEnvs;
+    };
+    auto takePhaseSnap = []() -> PhaseAllocSnap {
+        const auto & a = allocStats();
+        return {
+            threadArena().bytesAllocated(),
+            a.bytesValues, a.bytesClosures, a.bytesThunks,
+            a.bytesBindings, a.bytesLists, a.bytesPairs,
+            a.bytesChars, a.bytesEnvs,
+        };
+    };
+    PhaseAllocSnap snapStart = takePhaseSnap();
+    PhaseAllocSnap snapAfterLower = snapStart;
+    PhaseAllocSnap snapAfterOptimise = snapStart;
+    PhaseAllocSnap snapAfterCompile = snapStart;
+    PhaseAllocSnap snapAfterRun = snapStart;
+
+    // `module` is the already-lowered IR (from lowerV3Ast — the native
+    // parse+lower path; there is no longer a nix::Expr lowering path).
+    pt.mark(pt.lower_ms);
+
+    // #538: run the IR optimization pipeline (constant fold, CSE,
+    // strictness, alias inline, primop fuse, DCE).  Without this the
+    // v3-direct path emits massive amounts of redundant SET_LOCAL /
+    // GET_LOCAL through trivial bindings, plus per-LitInt force
+    // overhead — the lowerer's A-normal-form-style binding-per-
+    // subexpression pattern bloats the bytecode unless the optimizer
+    // collapses VarRef chains and elides redundant Forces.  The
+    // import-primop path (`primops.cc primImport`) already does this;
+    // the runRootExpr path silently skipped it before this fix.
+    static const bool s_noOptimise =
+        std::getenv("NIX_V3_NO_OPTIMISE") != nullptr;
+    snapAfterLower = takePhaseSnap();  // DIAG-4
+    if (!s_noOptimise) ir::optimise(module);
+    pt.mark(pt.optimise_ms);
+    snapAfterOptimise = takePhaseSnap();  // DIAG-4
+
+    // #737 Stage 4 v2: per-Function strictness inference.  Runs
+    // AFTER `optimise` (so any DCE-removed dead bindings and any
+    // inlined VarRef aliases are already collapsed) and BEFORE
+    // `computeFreeVars`.  Result is stored in
+    // `ir::Function::strictArgs`.
+    //
+    // #774 (2026-05-23): kept on the outer expression only.
+    // Falsifier: moving these into `ir::optimise()` (so primImport
+    // also exercises them) measured 1 elision in 40 961 considered
+    // Apps on hello.drvPath at ~33 ms wall-clock cost.  The
+    // bottleneck is `isInlinableMkThunk`'s single-use + simple-body
+    // constraints, not strictness analysis coverage.  Opt-in to
+    // all-modules via `NIX_V3_STAGE4_ALL_MODULES=1`.
+    // #742/#743 caller-side strictness: computeFunctionStrictness then
+    // applyStrictnessAtCallSites to a fixpoint (compound shapes — an outer
+    // MkThunk over an AttrSet whose entries are themselves thunked — need a
+    // pass per nesting level).  Factored into ir::applyStrictnessPasses so the
+    // `--emit-bytecode` dump runs the IDENTICAL sequence (see ir.hh).
+    ir::applyStrictnessPasses(module);
+
+    // computeFreeVars: populates each `ir::Function::freeVars` from
+    // `Function::vars`.  Required before `compile` so the emitter
+    // knows which upvalues each closure captures.  Must run AFTER
+    // `optimise` so any newly-introduced VarRef aliases are walked.
+    ir::computeFreeVars(module);
+
+    // Compile IR to bytecode.  The CompilationUnit owns
+    // `stringConstants` referenced by OP_LIT_STR / OP_LIT_PATH; the
+    // resulting Value's string/path payloads point into that vector.
+    //
+    // #676 — heap-allocate the CU via make_unique so its address is
+    // stable across any RootResult moves the caller may do (e.g.
+    // `std::optional::emplace` in eval.cc --apply).  Closures emitted
+    // by `run()` capture `c->cu = &cu` at OP_MAKE_CLOSURE time; if
+    // the CU lived inside RootResult by value, a subsequent move
+    // would leave every captured cu pointer dangling.  Pre-#676 this
+    // manifested as a SIGTRAP on `nix eval --impure --apply '(x: 42)'
+    // --expr '1'` — the closure's stale cu pointer made dispatchLoop
+    // read garbage bytecode.
+    RootResult out{std::make_unique<CompilationUnit>(compile(module)), Value{}};
+    // #772 spike: survey the OUTER expression's bytecode dedup too,
+    // so the survey reflects ALL compiled CUs, not just inner-import
+    // ones.  No-op when NIX_V3_DEDUP_SURVEY is unset.
+    surveyCUBytecodeDedup(*out.cu);
+    pt.mark(pt.compile_ms);
+    snapAfterCompile = takePhaseSnap();  // DIAG-4
+
+    // Run.  STG-10 (vm.cc:5530) automatically routes through
+    // `runOnExistingVm` if we're re-entered from another v3 dispatch
+    // loop — so calling `runRootExpr` from inside a primop is safe.
+    //
+    // #795 Phase A1+: emit stats even when run() throws (e.g.
+    // WallTimeExceededError on long-running haskell.nix evals).  Lets
+    // hypothesis-triage tests collect per-site bridge counts via a
+    // bounded-time probe rather than requiring the eval to complete.
+    // The static dump-stats gate below decides whether to emit; this
+    // catch only ensures the emission HAPPENS before re-throw.
+    //
+    // #875 Stage 1.5 (2026-05-29): tried setting the root Expr as
+    // the default fallback for bridges created during this eval.
+    // No effect — bridges created downstream inside primV3CallBridge1
+    // / primV3ForceAttr / primV3ForceListElem are wrapped by inner
+    // `ScopedBridgeFallbackExpr` guards that overwrite tl to the
+    // per-call fallback (typically nullptr today).  The runRootExpr-
+    // level guard is shadowed.  Stage 1.5 proper requires either an
+    // API refactor (v3ToTreeWalker takes Expr*) or per-bridge-
+    // creation-site Scoped guards.  See
+    // WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md.
+    // Top-level cache: reset the impurity taint HERE — after registerBuiltin
+    // PrimOps (148) + installAllBytecodePrimops (190), which run builtin bodies
+    // that call currentTime and would otherwise contaminate EVERY eval's taint
+    // (even a plain "abc").  Resetting right before the module's run() makes the
+    // taint reflect ONLY this module's evaluation.  Unconditional: nested
+    // installer runRootExprModule calls also reset before their own run(), but
+    // only the OUTERMOST run's taint is read (topLevelCacheShadow, depth==1).
+    topLevelTaintReset();
+    try {
+        out.value = run(*out.cu);
+    } catch (...) {
+        static const bool s_dumpStatsOnThrow =
+            std::getenv("NIX_VM_STATS") != nullptr;
+        if (s_dumpStatsOnThrow) {
+            const auto & a = allocStats();
+            std::fprintf(stderr,
+                "v3-direct ABORT alloc: thunksForced=%llu insns=%llu\n",
+                (unsigned long long)a.thunksForced,
+                (unsigned long long)a.bytecodeInstructions);
+            uint64_t totalV3Tw = 0;
+            for (uint8_t i = 0; i < 16; ++i) totalV3Tw += a.v3ToTwBySite[i];
+            if (totalV3Tw > 0) {
+                static const char * kSiteNames[16] = {
+                    "primReadFile_string_ctx", "primReadDir_attrset",
+                    "primImport_string_ctx",   "primImport_attrset",
+                    "primReadDir_string_ctx",  "primPathExists_ctx",
+                    "primDerivationStrict_TWfb","primV3CallBridge1",
+                    "FFI_leaves(fetch/path)",  "v3ToTW_eager_struct",
+                    "primTrace",               "primV3ForceAttr_inner",
+                    "dead_slot_12_was_BP3_force_list_elem","site_13",
+                    "site_14",                 "unattributed_other",
+                };
+                std::fprintf(stderr,
+                    "v3-direct ABORT v3ToTreeWalker (total=%llu):",
+                    (unsigned long long)totalV3Tw);
+                for (uint8_t i = 0; i < 16; ++i) {
+                    if (a.v3ToTwBySite[i] == 0) continue;
+                    std::fprintf(stderr, " %s=%llu",
+                        kSiteNames[i],
+                        (unsigned long long)a.v3ToTwBySite[i]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+            uint64_t totalProbes = 0;
+            for (uint8_t i = 0; i < 16; ++i) totalProbes += a.ifdProbeWithCtx[i];
+            if (totalProbes > 0) {
+                std::fprintf(stderr,
+                    "v3-direct ABORT ifd probes (with-ctx): total=%llu",
+                    (unsigned long long)totalProbes);
+                for (uint8_t k = 1; k < 16; ++k)
+                    if (a.ifdProbeWithCtx[k] > 0)
+                        std::fprintf(stderr, " %s=%llu",
+                            ifdProbeKindName(static_cast<uint8_t>(k)),
+                            (unsigned long long)a.ifdProbeWithCtx[k]);
+                std::fprintf(stderr, "\n");
+            }
+            std::fflush(stderr);
+        }
+        throw;
+    }
+    pt.mark(pt.run_ms);
+    snapAfterRun = takePhaseSnap();  // DIAG-4
+
+    // DIAG analysis spike (2026-05-29 evening): test the hypothesis
+    // that DIAG-2 Phase 2's 311 MB at all-packages.nix:9112 is held
+    // by the in-memory ImportCache.  Clearing the cache before
+    // dumpV3LiveFraction drops those roots; the resulting live-bytes
+    // delta quantifies what end-of-eval cache eviction would
+    // reclaim.  Safe AFTER run() returns; no further eval expected.
+    static const bool s_clearImportCache =
+        std::getenv("NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE") != nullptr;
+    if (__builtin_expect(s_clearImportCache, 0)) {
+        clearImportCacheResultsForDiag();
+        std::fprintf(stderr,
+            "v3-direct DIAG spike: cleared in-memory ImportCache "
+            "results (NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1)\n");
+    }
+    // (bridge-table DIAG clear retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
+
+    // Periodic L(t) CSV flush (Step 4 of post-Phase-3.8).  Hoisted OUT of
+    // the NIX_VM_STATS block (2026-06-15): the periodic live-trace is its
+    // own self-contained feature gated by NIX_V3_LIVE_TRACE_PERIODIC, and
+    // requiring the unrelated NIX_VM_STATS to also be set to get the CSV
+    // was a footgun (samples accumulated but never flushed).  The function
+    // self-gates (no-op unless periodicLiveTraceEnabled()), so this is
+    // unconditional and runs exactly once.
+    flushPeriodicLiveTraceCsv();
+
+    // LEVER-1 applied-import cache PROBE: self-gated (NIX_V3_APPLIED_CACHE=
+    // probe + non-zero counters), unconditional here for the same reason as
+    // flushPeriodicLiveTraceCsv above — the atexit variant loses its output in
+    // the `nix` binary.  Cumulative; the LAST line per process is authoritative.
+    dumpAppliedCacheProbeStats();
+    appliedCacheStatsDump();   // LEVER-1 real-cache counters (self-gates on activity)
+    ifdProvStatsDump();        // IFD provenance cache shadow counters (self-gates: off unless
+                               // NIX_V3_IFD_PROV_CACHE=shadow)
+    // Parallel-potential trace (NIX_V3_PAR_TRACE): work/span ceiling on
+    // intra-eval parallelism — the measure-first input for the
+    // parallel-eval candidate (PARALLEL_EVAL_CAPABILITIES §8/§9).  Placed
+    // here (NOT inside the NIX_VM_STATS block) + self-gated internally so
+    // the integrated `nix` CLI (flake/IFD workloads like M5) reaches it —
+    // the atexit variant loses output in the `nix` binary, same reason as
+    // appliedCacheStatsDump above.  Delete with the instrument once the
+    // parallel-eval GO/NO-GO is decided (Rule 0: no lingering opt-in gate).
+    nix::v3::partrace::dumpReport();
+    // Per-creation-site force-rate histogram (NIX_V3_FORCERATE_TRACE): the
+    // cheap-eagerness / optimistic-eval measure-first gate. Same placement
+    // rationale + self-gate + retirement rule as partrace above.
+    nix::v3::forcerate::dumpReport();
+    // (top-level result cache shadow dumps from runRootExprFromString, AFTER
+    // the outermost eval's shadow — see topLevelCacheShadow call there.)
+
+    // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
+    // attribute alloc explosions to thunks vs closures vs Bindings
+    // vs lists.
+    static const bool s_dumpStats =
+        std::getenv("NIX_VM_STATS") != nullptr;
+    if (__builtin_expect(s_dumpStats, 0)) {
+        // DIAG-4 (2026-05-29 evening, per DIAGNOSTIC_AUDIT §6.4 +
+        // user "elsewhere is ominous" directive): per-phase byte
+        // attribution.  Δarena per phase = upper-bound on what that
+        // phase contributed to the arena footprint.  Attributes the
+        // hitherto-ominous "elsewhere" bucket by phase.
+        auto deltaArenaMB = [&](const PhaseAllocSnap & a,
+                                const PhaseAllocSnap & b) {
+            return (b.arenaBytes > a.arenaBytes
+                    ? double(b.arenaBytes - a.arenaBytes) / 1e6 : 0.0);
+        };
+        auto deltaTagBytes = [](uint64_t a, uint64_t b) -> double {
+            return b > a ? double(b - a) / 1e6 : 0.0;
+        };
+        const double dLow  = deltaArenaMB(snapStart,         snapAfterLower);
+        const double dOpt  = deltaArenaMB(snapAfterLower,    snapAfterOptimise);
+        const double dCmp  = deltaArenaMB(snapAfterOptimise, snapAfterCompile);
+        const double dRun  = deltaArenaMB(snapAfterCompile,  snapAfterRun);
+        const double dTot  = deltaArenaMB(snapStart,         snapAfterRun);
+        std::fprintf(stderr,
+            "v3-direct phase arena bytes (MB): "
+            "lower=%.2f optimise=%.2f compile=%.2f run=%.2f total=%.2f\n",
+            dLow, dOpt, dCmp, dRun, dTot);
+        // M-10 (CODEBASE_REVIEW_2026-06-11): string-constant interning dedup
+        // measurement.  refs = total stringConstant slots across cached CUs;
+        // pool = unique interned strings.  Net memory vs the old owned-
+        // std::string layout is roughly:  Δ = pool*32B + refs*8B + poolChars
+        //                                    - refs*(32B + avgChars)
+        // i.e. interning WINS when refs >> pool (heavy cross-CU literal reuse).
+        {
+            const auto ps = stringConstantPoolStats();
+            const size_t refs = importCacheStringConstRefs();
+            const double dedup = refs ? double(refs - ps.poolEntries) / double(refs) : 0.0;
+            std::fprintf(stderr,
+                "v3-direct stringConstant interning (M-10): refs=%zu pool=%zu "
+                "poolChars=%zuB dedup=%.1f%% (pool 8B/ref + 32B+chars/unique vs "
+                "old 32B+chars/ref)\n",
+                refs, ps.poolEntries, ps.poolCharBytes, dedup * 100.0);
+        }
+        // Per-Tag breakdown for the RUN phase only (the dominant
+        // phase by far; per audit it owns ~98 % of arena growth).
+        // Other phases are aggregated above; per-Tag dump here helps
+        // see what RUN is allocating.
+        std::fprintf(stderr,
+            "v3-direct run-phase per-tag bytes (MB): "
+            "values=%.2f closures=%.2f thunks=%.2f bindings=%.2f "
+            "lists=%.2f pairs=%.2f chars=%.2f envs=%.2f\n",
+            deltaTagBytes(snapAfterCompile.bytesValues,   snapAfterRun.bytesValues),
+            deltaTagBytes(snapAfterCompile.bytesClosures, snapAfterRun.bytesClosures),
+            deltaTagBytes(snapAfterCompile.bytesThunks,   snapAfterRun.bytesThunks),
+            deltaTagBytes(snapAfterCompile.bytesBindings, snapAfterRun.bytesBindings),
+            deltaTagBytes(snapAfterCompile.bytesLists,    snapAfterRun.bytesLists),
+            deltaTagBytes(snapAfterCompile.bytesPairs,    snapAfterRun.bytesPairs),
+            deltaTagBytes(snapAfterCompile.bytesChars,    snapAfterRun.bytesChars),
+            deltaTagBytes(snapAfterCompile.bytesEnvs,     snapAfterRun.bytesEnvs));
+        const auto & a = allocStats();
+        std::fprintf(stderr,
+            "v3-direct alloc: values=%llu closures=%llu thunks=%llu "
+            "lists=%llu attrsets=%llu pairs=%llu thunksForced=%llu bridge=%llu insns=%llu\n",
+            (unsigned long long)a.valuesAllocated,
+            (unsigned long long)a.closuresAllocated,
+            (unsigned long long)a.thunksAllocated,
+            (unsigned long long)a.listsAllocated,
+            (unsigned long long)a.attrsetsAllocated,
+            (unsigned long long)a.pairsAllocated,
+            (unsigned long long)a.thunksForced,
+            (unsigned long long)a.bridgeThunksForced,
+            (unsigned long long)a.bytecodeInstructions);
+        // P0.B: the P2.1-a formals-by-arg-shape sizing dump was deleted with its
+        // probe (measurement complete; WS-2 handback).
+        // Phase-1 capture-model counters (BEAT_TW_V3_PLAN_2026-07-03 §3; Gate A).
+        // DETERMINISTIC; run CACHE-OFF (emit-side counters zero on a warm CU hit).
+        // The runtime capture-op share needs the total executed-op count, which is
+        // the NIX_VM_OPCOUNTS histogram total — rerun with NIX_VM_OPCOUNTS=1.
+        {
+            uint64_t totalOps = 0;
+            for (size_t i = 0; i < 256; ++i) totalOps += a.opcodeCounts[i];
+            uint64_t makes = a.makeThunkExecuted + a.makeClosureExecuted;
+            double capShareOps = totalOps
+                ? 100.0 * (double)a.captureOpsExecuted / (double)totalOps : 0.0;
+            double avgCapPerMake = makes
+                ? (double)a.captureOpsExecuted / (double)makes : 0.0;
+            uint64_t emitGets = a.captureGetsEmitted + a.bodyGetsEmitted;
+            double capShareEmit = emitGets
+                ? 100.0 * (double)a.captureGetsEmitted / (double)emitGets : 0.0;
+            double fwdShare = a.totalCapturesEmitted
+                ? 100.0 * (double)a.fwdCapturesEmitted / (double)a.totalCapturesEmitted : 0.0;
+            std::fprintf(stderr,
+                "v3 PHASE1 capture-model (Gate A inputs):\n"
+                "  C1 capture-op share (RUNTIME): captureOps=%llu / totalOps=%llu = %s%.2f%%"
+                "  [GATE A: BUILD >=8%%, CLOSE <4%%]\n"
+                "  C1 emit-time cross-check: captureGets=%llu / (capture+body=%llu) = %.2f%%\n"
+                "  C2 nUp-at-MAKE histogram: [0]=%llu [1]=%llu [2]=%llu [3]=%llu [4]=%llu [5+]=%llu\n"
+                "  C2 avg captures/MAKE=%.2f  (makes=%llu: thunk=%llu clo=%llu; withsTotal=%llu)\n"
+                "  C3 forwarding-capture share (emit): fwd=%llu / totalCaptures=%llu = %.2f%%"
+                "  [GATE A GO-branch: >=30%% & sibling-density>=1.5]\n",
+                (unsigned long long)a.captureOpsExecuted, (unsigned long long)totalOps,
+                (totalOps ? "" : "N/A(need NIX_VM_OPCOUNTS=1) "), capShareOps,
+                (unsigned long long)a.captureGetsEmitted, (unsigned long long)emitGets, capShareEmit,
+                (unsigned long long)a.nUpHist[0], (unsigned long long)a.nUpHist[1],
+                (unsigned long long)a.nUpHist[2], (unsigned long long)a.nUpHist[3],
+                (unsigned long long)a.nUpHist[4], (unsigned long long)a.nUpHist[5],
+                avgCapPerMake, (unsigned long long)makes,
+                (unsigned long long)a.makeThunkExecuted, (unsigned long long)a.makeClosureExecuted,
+                (unsigned long long)a.nWithsAtMakeTotal,
+                (unsigned long long)a.fwdCapturesEmitted,
+                (unsigned long long)a.totalCapturesEmitted, fwdShare);
+        }
+        // #702: BYTES per allocation category.  The count counters
+        // above are partly bumped at primop call sites and miss
+        // Alloc::* invocations from vm.cc dispatch; the byte
+        // counters are bumped inside Alloc::* itself so they are
+        // authoritative.  Use them to attribute non-Boehm RSS
+        // growth (per `hello-drvpath-analysis.md`: the 4 GB on
+        // hello.drvPath lives outside Boehm — these byte counters
+        // tell us which v3 subsystem owns the growth).
+        const uint64_t totalAllocBytes =
+              a.bytesValues + a.bytesClosures + a.bytesThunks + a.bytesEnvs
+            + a.bytesLists  + a.bytesBindings + a.bytesPairs   + a.bytesChars;
+        std::fprintf(stderr,
+            "v3-direct bytes (in arena/nursery): values=%.1fMB closures=%.1fMB "
+            "thunks=%.1fMB envs=%.1fMB lists=%.1fMB bindings=%.1fMB pairs=%.1fMB "
+            "chars=%.1fMB total_alloc=%.1fMB arena_pinned=%.1fMB\n",
+            a.bytesValues   / 1e6,
+            a.bytesClosures / 1e6,
+            a.bytesThunks   / 1e6,
+            a.bytesEnvs     / 1e6,
+            a.bytesLists    / 1e6,
+            a.bytesBindings / 1e6,
+            a.bytesPairs    / 1e6,
+            a.bytesChars    / 1e6,
+            totalAllocBytes / 1e6,
+            threadArena().bytesAllocated() / 1e6);
+        // #703: per-Bindings-size histogram.  Tells us how much of
+        // the 2.97 M Bindings would benefit from Empty/Single/Small
+        // sentinel shapes vs. how many really need the full Sorted
+        // form.  Buckets are: 0, 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64,
+        // 65-128, 129+.
+        const auto & bk = a.attrsetSizeBuckets;
+        std::fprintf(stderr,
+            "v3-direct bindings size hist: 0=%llu 1=%llu 2=%llu "
+            "3-4=%llu 5-8=%llu 9-16=%llu 17-32=%llu 33-64=%llu "
+            "65-128=%llu 129+=%llu\n",
+            (unsigned long long)bk[0], (unsigned long long)bk[1],
+            (unsigned long long)bk[2], (unsigned long long)bk[3],
+            (unsigned long long)bk[4], (unsigned long long)bk[5],
+            (unsigned long long)bk[6], (unsigned long long)bk[7],
+            (unsigned long long)bk[8], (unsigned long long)bk[9]);
+        // #821 (2026-05-26): per-caller mergeBindings attribution.
+        // On HNE .hello.drvPath, mergeBindings owns ~584 MB of 705 MB
+        // Bindings allocation (82.9 %).  This per-site breakdown
+        // identifies WHICH of the 9 callers dominates so the per-site
+        // optimisation (ChainBindings overlay / lazy merge / etc.)
+        // targets the right path instead of re-architecting all
+        // 9 sites.  Suppressed when no merges occurred.
+        {
+            const char * site_name[AllocStats::kMergeBindingsSiteSlots] = {
+                "OP_ATTRS_UPDATE             (//)",
+                "OP_ATTRS_UPDATE_TAIL        (//)",
+                "OP_CALL ExtendsBody  prev//ov",
+                "OP_CALL ExtendsBody  prev//f",
+                "OP_CALL ComposeBody  fApp//gApp",
+                "OP_TAIL_CALL Extends prev//ov",
+                "OP_TAIL_CALL Extends prev//f",
+                "OP_TAIL_CALL Compose fApp//gApp",
+                "(spare 8)",  "(spare 9)",  "(spare 10)", "(spare 11)",
+                "(spare 12)", "(spare 13)", "(spare 14)", "(spare 15)",
+            };
+            uint64_t totalCalls = 0, totalBytes = 0;
+            for (uint8_t s = 0; s < AllocStats::kMergeBindingsSiteSlots; ++s) {
+                totalCalls += a.mergeBindingsCallsBySite[s];
+                totalBytes += a.mergeBindingsBytesBySite[s];
+            }
+            if (totalCalls > 0) {
+                std::fprintf(stderr,
+                    "v3-direct mergeBindings by site "
+                    "(total %llu calls, %.1f MB):\n",
+                    (unsigned long long)totalCalls,
+                    double(totalBytes) / (1024.0 * 1024.0));
+                for (uint8_t s = 0; s < AllocStats::kMergeBindingsSiteSlots; ++s) {
+                    uint64_t calls = a.mergeBindingsCallsBySite[s];
+                    uint64_t bytes = a.mergeBindingsBytesBySite[s];
+                    if (calls == 0 && bytes == 0) continue;
+                    std::fprintf(stderr,
+                        "  [%d] %-32s  calls=%-10llu bytes=%6.1f MB"
+                        " (%5.1f %% of total)\n",
+                        (int)s, site_name[s],
+                        (unsigned long long)calls,
+                        double(bytes) / (1024.0 * 1024.0),
+                        totalBytes > 0
+                            ? 100.0 * double(bytes) / double(totalBytes)
+                            : 0.0);
+                }
+            }
+            // #821 — (na, nb) histograms for `//` UPDATE / UPDATE_TAIL.
+            // If the overlay (nb) histogram is heavily skewed toward
+            // small buckets while parent (na) is large, ChainBindings
+            // is the right architectural lever.
+            uint64_t naTotal = 0, nbTotal = 0;
+            for (int i = 0; i < 10; ++i) {
+                naTotal += a.mergeBindingsNaHist[i];
+                nbTotal += a.mergeBindingsNbHist[i];
+            }
+            if (naTotal > 0 || nbTotal > 0) {
+                const char * labels[10] = {
+                    "0", "1", "2-4", "5-8", "9-16",
+                    "17-32", "33-64", "65-128", "129-256", "257+"};
+                std::fprintf(stderr,
+                    "  (UPDATE/UPDATE_TAIL na histogram, total=%llu):\n",
+                    (unsigned long long)naTotal);
+                for (int i = 0; i < 10; ++i)
+                    std::fprintf(stderr, "    na %-8s = %llu\n",
+                        labels[i], (unsigned long long)a.mergeBindingsNaHist[i]);
+                std::fprintf(stderr,
+                    "  (UPDATE/UPDATE_TAIL nb histogram, total=%llu):\n",
+                    (unsigned long long)nbTotal);
+                for (int i = 0; i < 10; ++i)
+                    std::fprintf(stderr, "    nb %-8s = %llu\n",
+                        labels[i], (unsigned long long)a.mergeBindingsNbHist[i]);
+            }
+        }
+        // (bridge-table size/distribution dump retired —
+        //  TW_VALUE_ERADICATION F4, 2026-06-02; the tables are deleted.)
+        // EXIT_GC_SPIRAL Day 13-15 (2026-05-29): singleton-capturedWiths
+        // intern-cache hit rate.  Hit rate near 100 % means the cache
+        // is doing its job (most 1-element capturedWiths reuse a
+        // shared ListVec).  Low hit rate + high evicts means either
+        // many unique with-targets (workload-specific) or hash
+        // collisions thrashing — bump kCapWithsCacheBuckets if so.
+        {
+            uint64_t h = getCapWithsHits();
+            uint64_t m = getCapWithsMisses();
+            uint64_t e = getCapWithsEvicts();
+            if (h + m > 0) {
+                double hitRate = 100.0 * (double)h / (double)(h + m);
+                constexpr double oneElemListBytes =
+                    double(sizeof(ListVec) + sizeof(Value));
+                std::fprintf(stderr,
+                    "v3-direct capWiths-intern: hits=%llu misses=%llu "
+                    "evicts=%llu hitRate=%.1f%% (estimated savings ~%.1f MB "
+                    "@ %.0f B/hit)\n",
+                    (unsigned long long)h, (unsigned long long)m,
+                    (unsigned long long)e,
+                    hitRate,
+                    h * oneElemListBytes / 1e6,
+                    oneElemListBytes);
+            }
+        }
+        // #719 (#702 falsifier chain, 2026-05-21): three-way RSS
+        // decomposition.  v3's RSS minus (Boehm-heap + v3-arena) is
+        // the "elsewhere" remainder — scratch buffers, libc malloc
+        // for std::vector/unordered_map growth, mmap'd nursery,
+        // process bookkeeping.  Lets the user attribute the cppnix-
+        // vs-v3 RSS gap by category instead of treating it as a
+        // single number.
+        //
+        // Why this matters: hello.drvPath under v3 measures ~2.14 GB
+        // peak RSS vs 145 MB for TW.  Existing byte counters already
+        // attribute ~940 MB to the v3 arena; the remaining ~1.2 GB
+        // must be split between Boehm (TW interop) and "other"
+        // (libc malloc, mmap).  Stage 3 Phase D shape (a/b/c) depends
+        // on which one dominates.
+#if NIX_USE_BOEHMGC
+        // 2026-05-27 §6.2 spike: NIX_V3_BOEHM_FORCE_UNMAP=1 fires
+        // `GC_gcollect_and_unmap()` once before reading heap stats,
+        // letting us observe whether Boehm's munmap is functional on
+        // this build/platform (some builds skip USE_MUNMAP).  If the
+        // mechanism works, the reported boehm_heap drops and the
+        // boehm_unmapped grows by the same delta.  Sequel: fire from
+        // checkLimits() periodically to reduce peak_rss mid-eval.
+        // Retirement: when periodic-unmap is wired into checkLimits
+        // OR when Boehm is downscoped to FFI-only, drop the gate.
+        static const bool s_forceUnmap =
+            std::getenv("NIX_V3_BOEHM_FORCE_UNMAP") != nullptr;
+        if (s_forceUnmap) {
+            // Boehm's `force_unmap_on_gcollect` flag is the actual
+            // switch — `GC_gcollect_and_unmap()` is documented to
+            // unmap unconditionally, but in practice on macOS the
+            // unmap depends on this flag being set.  Enable it
+            // alongside the explicit collect call to be sure.
+            GC_set_force_unmap_on_gcollect(1);
+            GC_gcollect_and_unmap();
+        }
+        size_t boehmHeap = GC_get_heap_size();
+        size_t boehmFree = GC_get_free_bytes();
+        size_t boehmUnmapped = GC_get_unmapped_bytes();
+        // 2026-05-27: Boehm GC time/count instrumentation — falsifier
+        // gate for "ditch Boehm" perf claims.  GC_get_gc_no() counts
+        // collections; GC_get_full_gc_total_time() returns total time
+        // spent in full collections (milliseconds, accumulates across
+        // process lifetime).  Both APIs are zero-cost reads (atomic
+        // loads of stat counters maintained by the collector).
+        //
+        // If Boehm GC time is sub-1 % of wall, ditching Boehm cannot
+        // deliver wall improvement; the memory-RSS case (~400 MB
+        // peak) becomes the sole motivation, which is bounded by
+        // precise-root infrastructure work (~1-2 weeks) per
+        // IDEAL_GC_DESIGN_2026-05-26.md "no-regret foundations".
+        GC_word boehmGcNo = GC_get_gc_no();
+        unsigned long boehmGcMs = GC_get_full_gc_total_time();
+#else
+        size_t boehmHeap = 0;
+        size_t boehmFree = 0;
+        size_t boehmUnmapped = 0;
+        GC_word boehmGcNo = 0;
+        unsigned long boehmGcMs = 0;
+#endif
+        size_t rssBytes = 0;
+        {
+            struct rusage ru;
+            if (getrusage(RUSAGE_SELF, &ru) == 0) {
+#ifdef __APPLE__
+                // macOS reports ru_maxrss in bytes.
+                rssBytes = static_cast<size_t>(ru.ru_maxrss);
+#else
+                // Linux reports ru_maxrss in KB.
+                rssBytes = static_cast<size_t>(ru.ru_maxrss) * 1024;
+#endif
+            }
+        }
+        const size_t arenaPin = threadArena().bytesAllocated();
+        // "Elsewhere" = RSS − Boehm-heap − v3-arena (clamped at 0).
+        const size_t elsewhere = (rssBytes > boehmHeap + arenaPin)
+            ? rssBytes - boehmHeap - arenaPin : 0;
+        std::fprintf(stderr,
+            "v3-direct memory: peak_rss=%.1fMB boehm_heap=%.1fMB "
+            "boehm_free=%.1fMB boehm_unmapped=%.1fMB v3_arena=%.1fMB "
+            "elsewhere=%.1fMB\n",
+            rssBytes      / 1e6,
+            boehmHeap     / 1e6,
+            boehmFree     / 1e6,
+            boehmUnmapped / 1e6,
+            arenaPin      / 1e6,
+            elsewhere     / 1e6);
+        // M0.1 (BOUNDED_MEMORY_PLAN_2026-06-29): unified RSS decomposition —
+        // attribute every MB of peak_rss to a NAMED, boundability-classified bucket
+        // so the bounded-memory levers can each be sized + measured against this:
+        //   peak_rss = arena + CU-bytecode + SQLite + Boehm-heap + residual
+        //   arena       — the never-munmap wall (M3); live/dead split on the
+        //                 "v3 major-mark-sweep" line (needs a sweep to know live).
+        //   CU-bytecode — libc-malloc'd CompilationUnits, held whole-eval (M2 evict).
+        //   SQLite      — disk-cache page-cache resident (M1.B cache_size cap).
+        //   Boehm-heap  — ~all reserved-free, pinned by arena-as-GC-root (M1.A dereg).
+        //   residual    — malloc fragmentation + posPool/symtab/stringContext + binary.
+        // GATE (M0.1): the named buckets reconcile to peak_rss (residual ≥ 0); the
+        // residual names what is NOT yet separately attributed.
+        {
+            // Reconcile EXACTLY: peak_rss = arena + CU-bytecode + SQLite + rest, where
+            // each of arena/CU/SQLite is a cleanly-measurable RESIDENT bucket and `rest`
+            // is the remainder.  Boehm is reported as a sub-figure of `rest` because its
+            // heap (boehm_heap) is RESERVED, not resident — its free pages are only
+            // partly faulted, so adding boehm_heap whole would oversum peak_rss.  `rest`
+            // therefore holds Boehm's RESIDENT pages (<= reserved) + malloc-frag +
+            // posPool/symtab/stringContext + binary.  Boehm-reserved is the M1.A target.
+            const size_t cuBytecode = importCacheBytecodeBytes();
+            const size_t cuCount    = importCacheCuCount();
+            const size_t sqliteRes  = disk_cache::approxResidentBytes();
+            const size_t measured   = arenaPin + cuBytecode + sqliteRes;
+            const size_t rest       = rssBytes > measured ? rssBytes - measured : 0;
+            std::fprintf(stderr,
+                "v3-direct RSS-decomp (peak_rss=%.0fMB): arena=%.0f + "
+                "CU-bytecode=%.0f(%zu CUs) + SQLite=%.0f + rest=%.0f  "
+                "[rest = Boehm-resident(<=reserved %.0f, free %.0f; M1.A) + malloc-frag "
+                "+ posPool/symtab + binary; arena live/dead -> major-mark-sweep line]\n",
+                rssBytes / 1e6, arenaPin / 1e6,
+                cuBytecode / 1e6, cuCount, sqliteRes / 1e6, rest / 1e6,
+                boehmHeap / 1e6, boehmFree / 1e6);
+        }
+#ifdef __APPLE__
+        // M1.D (BOUNDED_MEMORY_PLAN_2026-06-29): probe malloc-fragmentation
+        // reclaimability.  Reads CURRENT resident (phys_footprint, not maxrss),
+        // forces libmalloc to return freed-but-retained pages to the OS
+        // (malloc_zone_pressure_relief, all zones), re-reads.  A large drop => the
+        // "rest" bucket holds reclaimable malloc fragmentation => a MID-EVAL-safepoint
+        // pressure-relief could lower PEAK (the M1.D lever).  Gated
+        // NIX_V3_MALLOC_RECLAIM_PROBE; retire once the reclaim decision is made.
+        static const bool s_mallocReclaimProbe =
+            std::getenv("NIX_V3_MALLOC_RECLAIM_PROBE") != nullptr;
+        if (s_mallocReclaimProbe) {
+            auto curResident = []() -> size_t {
+                task_vm_info_data_t vmInfo;
+                mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+                if (task_info(mach_task_self(), TASK_VM_INFO,
+                        reinterpret_cast<task_info_t>(&vmInfo), &cnt) == KERN_SUCCESS)
+                    return static_cast<size_t>(vmInfo.phys_footprint);
+                return 0;
+            };
+            const size_t before = curResident();
+            malloc_zone_pressure_relief(nullptr, 0);   // all zones, reclaim all
+            const size_t after = curResident();
+            std::fprintf(stderr,
+                "v3-direct malloc-reclaim probe: current_resident %.0fMB -> %.0fMB "
+                "(pressure_relief returned %.0fMB to OS)\n",
+                before / 1e6, after / 1e6,
+                (before > after ? before - after : 0) / 1e6);
+        }
+#endif
+        // 2026-05-27: Boehm GC time/count line — input to the
+        // "ditch Boehm" decision per IDEAL_GC_DESIGN_2026-05-26.md.
+        // If boehm_gc_ms is sub-1 % of overall wall, the wall case
+        // for replacement is weak; the memory-peak case (~400 MB
+        // reserved heap) becomes the sole driver.
+        std::fprintf(stderr,
+            "v3-direct boehm: gc_count=%llu gc_total_ms=%lu "
+            "(time spent in full collections during process lifetime)\n",
+            (unsigned long long)boehmGcNo,
+            (unsigned long)boehmGcMs);
+        // 2026-05-27 Stage 3 precise-root foundation: opt-in dump
+        // (V3_DBG_ROOT_DUMP=1) of every reachable v3-heap root
+        // pointer.  No-op when env-var unset; near-zero cost when
+        // set (one walk of the root sources).
+        // See lode/GC_PRECISE_ROOT_FOUNDATION_2026-05-27.md.
+        dumpAllV3Roots();
+        // 2026-05-27 Stage 6 SPIKE: live-fraction tracer.  Walks
+        // transitively from precise roots; counts unique reachable
+        // objects per type; reports LIVE-vs-ALLOCATED ratio per type
+        // + aggregate freeable-bytes verdict.  Gated NIX_V3_LIVE_TRACE=1
+        // (zero cost when unset).
+        //
+        // Retirement criterion: when Stage 6 lands the real precise GC
+        // of v3 arena, fold into NIX_VM_STATS and remove the gate.
+        dumpV3LiveFraction();
+        // 2026-06-04: LIVE MEMORY BUCKETS — the honest, GHC-style
+        // resident decomposition the user asked for (CU cache / BC
+        // cache / eval-live / FFI-live).  Replaces the misleading
+        // cumulative-vs-peak headline formula with a same-instant
+        // resident split.  Gated NIX_V3_MEM_BUCKETS=1 (zero cost unset).
+        // Retirement: fold into NIX_VM_STATS when the precise GC ships
+        // default-on and v3_arena becomes a live-bytes proxy.
+        dumpV3MemoryBuckets();
+        // (per-bridge-entry retention dump retired — TW_VALUE_ERADICATION F4.)
+        // Day 5 2026-05-28: per-block fill probe.  Decision data for
+        // Stage 6 generational tenured collector (GHC-RTS style).
+        // Gated NIX_V3_BLOCK_PROBE=1; zero cost otherwise.
+        dumpV3LiveBlockProbe();
+        // (periodic L(t) CSV flush hoisted above the NIX_VM_STATS gate —
+        // see flushPeriodicLiveTraceCsv() call before `s_dumpStats`.)
+        // #660 verification: dump bridge-primop call counts.  v3-eval
+        // already does this via its own NIX_VM_STATS path; mirror here
+        // so the integrated `nix` CLI (and any future v3 driver that
+        // goes through `runRootExpr`) reports the same data without
+        // depending on the CLI specifically.
+        dumpPrimOpStats(stderr);
+        // P2.1 step-0 measure (2026-07-02, TEMPORARY): formal-wrapper thunk
+        // alloc share (audit §4.1).  entryCu=nullptr — the import cache holds
+        // the bulk (nixpkgs formals); the tiny top-level CU is negligible.
+        dumpFormalWrapperStats(stderr, nullptr);
+        // #777b (2026-05-23) deserialize per-section breakdown.
+        // Only printed when V3_DBG_DESERIALIZE=1 (gated to avoid
+        // ~50 ns / clock_gettime overhead on every section in
+        // steady state).  Falsifier mechanism for "where inside
+        // the 334 ms deserialize budget does the time actually
+        // go?".
+        if (serialize::deserializeBreakdownEnabled()) {
+            const auto b = serialize::deserializeBreakdown();
+            if (b.calls > 0) {
+                std::fprintf(stderr,
+                    "v3-direct deserialize breakdown (ms, calls=%llu): "
+                    "header=%.3f code=%.3f intConsts=%.3f floatConsts=%.3f "
+                    "stringConsts=%.3f symbolTable=%.3f lambdas=%.3f "
+                    "lambdaCodeOffsets=%.3f primops=%.3f misc=%.3f remap=%.3f\n",
+                    (unsigned long long)b.calls,
+                    b.headerNs            / 1e6,
+                    b.codeNs              / 1e6,
+                    b.intConstantsNs      / 1e6,
+                    b.floatConstantsNs    / 1e6,
+                    b.stringConstantsNs   / 1e6,
+                    b.symbolTableNs       / 1e6,
+                    b.lambdasNs           / 1e6,
+                    b.lambdaCodeOffsetsNs / 1e6,
+                    b.primopsNs           / 1e6,
+                    b.miscNs              / 1e6,
+                    b.remapNs             / 1e6);
+            }
+        }
+        // #827 / A3: per-call-site cache-hook dump.  Gated by
+        // NIX_VM_CACHE_SITES=1 inside `dumpCacheHookSites`; empty
+        // dump suppressed automatically (no probe activations).
+        // Provides a per-call-site breakdown of every instrumented
+        // cache check so investigations (Phase 4b cache scope, etc.)
+        // can localise which site fires with which hit profile.
+        dumpCacheHookSites(stderr);
+
+        // #770 / #777 promotion (2026-05-22 / 2026-05-23): disk
+        // cache effectiveness.  Now default-on; prints whenever
+        // primImport ran.  hits/misses/inserts/failures lets the
+        // user see whether the cache is firing.  Opt-out via
+        // NIX_V3_NO_DISK_CACHE=1 leaves all counters at zero.
+        {
+            const auto & dc = disk_cache::stats();
+            if (dc.lookups + dc.inserts > 0) {
+                std::fprintf(stderr,
+                    "v3-direct disk_cache: lookups=%llu hits=%llu misses=%llu "
+                    "inserts=%llu insertFailures=%llu hit_rate=%.1f%%\n",
+                    (unsigned long long)dc.lookups,
+                    (unsigned long long)dc.hits,
+                    (unsigned long long)dc.misses,
+                    (unsigned long long)dc.inserts,
+                    (unsigned long long)dc.insertFailures,
+                    dc.lookups > 0
+                        ? 100.0 * (double)dc.hits / (double)dc.lookups
+                        : 0.0);
+            }
+        }
+        // WS5-D2a — AOT-borrow share rate.  codeBorrowed/cus is the fraction
+        // of AOT-loaded CUs whose bytecode pages became cross-process
+        // shareable (borrowed un-rewritten); the rest fell back to a private
+        // remapped copy.  Only printed when the AOT-borrow path fired.
+        {
+            const auto bs = serialize::aotBorrowStats();
+            if (bs.cus > 0) {
+                std::fprintf(stderr,
+                    "v3-direct AOT-borrow: cus=%llu codeBorrowed=%llu "
+                    "codeOwned=%llu podBorrowed=%llu lambdasBorrowed=%llu "
+                    "lambdasOwned=%llu codeBorrowRate=%.1f%% "
+                    "lambdasBorrowRate=%.1f%%\n",
+                    (unsigned long long)bs.cus,
+                    (unsigned long long)bs.codeBorrowed,
+                    (unsigned long long)bs.codeOwned,
+                    (unsigned long long)bs.podBorrowed,
+                    (unsigned long long)bs.lambdasBorrowed,
+                    (unsigned long long)bs.lambdasOwned,
+                    100.0 * (double)bs.codeBorrowed / (double)bs.cus,
+                    100.0 * (double)bs.lambdasBorrowed / (double)bs.cus);
+            }
+        }
+        // #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
+        // Only printed when NIX_V3_DEDUP_SURVEY=1.  totalFunctions /
+        // uniqueHashes is the LOWER BOUND dedup ratio (real IR-level
+        // alpha-equivalent dedup can only be higher).  ≥5× justifies
+        // Stage 9 investment; <2× kills it.
+        {
+            const auto & sur = dedupSurvey();
+            if (sur.totalFunctions > 0) {
+                double fnRatio = sur.uniqueHashes > 0
+                    ? (double)sur.totalFunctions / (double)sur.uniqueHashes
+                    : 0.0;
+                double byteRatio = sur.uniqueBytes > 0
+                    ? (double)sur.totalBytes / (double)sur.uniqueBytes
+                    : 0.0;
+                std::fprintf(stderr,
+                    "v3-direct dedup_survey: totalFunctions=%llu "
+                    "uniqueHashes=%llu fn_dedup_lb=%.2fx "
+                    "totalBytes=%.1fKB uniqueBytes=%.1fKB byte_dedup_lb=%.2fx\n",
+                    (unsigned long long)sur.totalFunctions,
+                    (unsigned long long)sur.uniqueHashes,
+                    fnRatio,
+                    sur.totalBytes / 1024.0,
+                    sur.uniqueBytes / 1024.0,
+                    byteRatio);
+            }
+        }
+        // #738 Phase E v0.1 (2026-05-21) survival-rate banner.
+        // Emit when ANY scavenge ran during this eval.  The
+        // headline number is the young-gen mortality rate:
+        //     died / (died + survived).
+        // High mortality (>50%) means most allocs are short-lived
+        // — Phase E's survivor-pool design would recover those
+        // bytes.  Low mortality (<10%) means most allocs survive
+        // forever — Phase E wouldn't help; objects would just sit
+        // in survivor pool instead of tenured.  This is the Rule 0
+        // input that drives the v0.2 architectural decision.
+        {
+            const auto & nur = threadNursery();
+            const auto & ns  = nur.stats();
+            if (ns.scavengeCount > 0
+                && (ns.survivedBytes > 0 || ns.diedBytes > 0))
+            {
+                const uint64_t total = ns.survivedBytes + ns.diedBytes;
+                const double mortality = total > 0
+                    ? (double(ns.diedBytes) * 100.0 / double(total))
+                    : 0.0;
+                std::fprintf(stderr,
+                    "v3-direct phase-e survival: scavenges=%llu "
+                    "survived=%.1fMB died=%.1fMB mortality=%.1f%% "
+                    "(Phase E v0.2 design driver: kill rate)\n",
+                    (unsigned long long)ns.scavengeCount,
+                    ns.survivedBytes / 1e6,
+                    ns.diedBytes     / 1e6,
+                    mortality);
+                // Path B (2026-05-27, per PHASE_E_V02_DAY2_FALSIFIED):
+                // Bypass / overflow diagnostic — the Day-2 measurement
+                // showed a 10× gap between expected mortality savings
+                // and observed (334 MB ideal vs 33.6 MB actual on
+                // hello).  Likely cause: most allocations bypass the
+                // nursery via overflow → tenured-arena fallback.  This
+                // ratio tells the next session whether the bypass
+                // policy is the bottleneck.
+                //
+                // nursery_hits  = ns.allocCount (allocations that
+                //                  landed in the nursery)
+                // nursery_misses = ns.overflowCount (fell through to
+                //                  arena because nursery was full)
+                //
+                // If misses >> hits → nursery is too small for the
+                // workload's allocation rate → larger nursery OR
+                // more aggressive scavenge trigger.
+                // If hits >> misses → bypass isn't the issue; the
+                // low mortality is intrinsic to the workload.
+                {
+                    const uint64_t hits   = ns.allocCount;
+                    const uint64_t misses = ns.overflowCount;
+                    const uint64_t total  = hits + misses;
+                    const double hitPct = total > 0
+                        ? (double(hits) * 100.0 / double(total))
+                        : 0.0;
+                    std::fprintf(stderr,
+                        "v3-direct nursery routing: hits=%llu misses=%llu "
+                        "hit_rate=%.1f%% allocBytes=%.1fMB "
+                        "(Path B audit: bypass = arena fallback on full)\n",
+                        (unsigned long long)hits,
+                        (unsigned long long)misses,
+                        hitPct,
+                        ns.allocBytes / 1e6);
+                }
+                // #738 Phase E v0.2: when active, show per-region
+                // promotion breakdown.  yToS is age-1 survivors
+                // (kept in survivor pool, not tenured); sToT is
+                // age-2 (truly tenured); yToTOvf is direct
+                // promotion when the survivor pool overflowed (or
+                // the legacy Phase D path where there's no S at
+                // all).  reclaimedFromS = bytesYToS - bytesSToT
+                // tracks the marginal Phase E reclamation: bytes
+                // that survived Y but died in S before tenuring.
+                if (nur.isPhaseEActive()) {
+                    const uint64_t yToS    = nur.getBytesYToS();
+                    const uint64_t sToT    = nur.getBytesSToT();
+                    const uint64_t yToTOvf = nur.getBytesYToTOvf();
+                    const int64_t reclaimedFromS =
+                        (int64_t)yToS - (int64_t)sToT;
+                    std::fprintf(stderr,
+                        "v3-direct phase-e regions: yToS=%.1fMB "
+                        "sToT=%.1fMB yToTOvf=%.1fMB "
+                        "reclaimedFromS=%.1fMB (Phase E v0.2 marginal "
+                        "win over Phase D)\n",
+                        yToS    / 1e6,
+                        sToT    / 1e6,
+                        yToTOvf / 1e6,
+                        reclaimedFromS / 1e6);
+                }
+            }
+        }
+        // #778 (2026-05-23) opcount Top-N rollup — Stage 5 (shapes/
+        // PICs) decision input.  Emitted under NIX_VM_OPCOUNTS=1 only
+        // (the per-op increment is the same gate from vm.cc:2572).
+        // Shows the top 12 opcodes by count plus the AttrSelect /
+        // AttrSelectDyn / AttrsHas share — Stage 5 only makes sense
+        // if those sites are ≥10 % of dispatch.  Below that, the
+        // PIC's amortisation can't move wall clock.
+        {
+            const auto & a = allocStats();
+            uint64_t totalDispatch = 0;
+            for (size_t i = 0; i < 256; ++i) totalDispatch += a.opcodeCounts[i];
+            if (totalDispatch > 0) {
+                // Sort opcodes by count descending.
+                struct OpRow { uint8_t code; uint64_t count; };
+                OpRow rows[256];
+                size_t nz = 0;
+                for (size_t i = 0; i < 256; ++i) {
+                    if (a.opcodeCounts[i] > 0) {
+                        rows[nz++] = { (uint8_t)i, a.opcodeCounts[i] };
+                    }
+                }
+                std::sort(rows, rows + nz,
+                    [](const OpRow & x, const OpRow & y) {
+                        return x.count > y.count;
+                    });
+                std::fprintf(stderr,
+                    "v3-direct opcounts: total=%llu (top-12 + AttrSelect family):\n",
+                    (unsigned long long)totalDispatch);
+                const size_t topN = std::min<size_t>(12, nz);
+                for (size_t i = 0; i < topN; ++i) {
+                    std::fprintf(stderr,
+                        "  %-26s %12llu  %5.2f%%\n",
+                        opName(static_cast<Op>(rows[i].code)),
+                        (unsigned long long)rows[i].count,
+                        100.0 * rows[i].count / totalDispatch);
+                }
+                // AttrSelect-family share (Stage 5 input).
+                uint64_t selFam =
+                      a.opcodeCounts[OP_ATTRS_SELECT]
+                    + a.opcodeCounts[OP_ATTRS_SELECT_DYN]
+                    + a.opcodeCounts[OP_ATTRS_HAS]
+                    + a.opcodeCounts[OP_ATTRS_HAS_DYN];
+                std::fprintf(stderr,
+                    "  --AttrSelect family-- %12llu  %5.2f%% "
+                    "(Stage 5 PIC kill criterion: <10%%)\n",
+                    (unsigned long long)selFam,
+                    100.0 * selFam / totalDispatch);
+
+                // REG-VM MEASUREMENT (2026-06-29): project a Lua-style REGISTER VM
+                // from the per-instruction frame-occupancy histogram.  Model: cap the
+                // register window at K; the bottom K frame slots are registers, slots
+                // ≥ K spill to memory.  A collapsible data-move op (GET/SET local/upval)
+                // accessing occupancy d FOLDS into an operand iff d < K (its slot is a
+                // register); at d ≥ K it stays as a spilled memory access.  So:
+                //   collapsed(K) = Σ_{d<K} regCollapsibleHist[d]
+                //   newOps(K)    = totalDispatch − collapsed(K)
+                //   opReduction  = collapsed(K) / totalDispatch
+                // This is EXACT for the cap-K-window+linear-spill model (per-instruction
+                // occupancy IS the operand's register index).  CPU win ≈ opReduction ×
+                // (dispatch + value-stack-traffic share of CPU) — NOT 1:1 (the folded
+                // ops are cheap); pair with the on-CPU profile for the wall estimate.
+                uint64_t totPress = 0, totCollapsible = 0;
+                for (size_t i = 0; i < 64; ++i) {
+                    totPress += a.regPressureHist[i];
+                    totCollapsible += a.regCollapsibleHist[i];
+                }
+                if (totPress > 0) {
+                    std::fprintf(stderr,
+                        "v3-direct REG-VM projection (frame occupancy = locals+temps; "
+                        "%llu collapsible data-moves = %.1f%% of dispatch):\n",
+                        (unsigned long long)totCollapsible,
+                        100.0 * totCollapsible / totPress);
+                    // occupancy distribution percentiles (where does pressure sit?)
+                    std::fprintf(stderr, "  occupancy histogram (%% of instrs at depth d):\n   ");
+                    uint64_t cum = 0;
+                    for (size_t d = 0; d < 20; ++d) {
+                        std::fprintf(stderr, " d%zu=%.0f%%", d,
+                            100.0 * a.regPressureHist[d] / totPress);
+                    }
+                    std::fprintf(stderr, "\n");
+                    static const int Ks[] = {3, 5, 7, 9, 12, 16, 24, 32};
+                    for (int K : Ks) {
+                        uint64_t fit = 0, collapsed = 0;
+                        for (int d = 0; d < K && d < 64; ++d) {
+                            fit += a.regPressureHist[d];
+                            collapsed += a.regCollapsibleHist[d];
+                        }
+                        std::fprintf(stderr,
+                            "  K=%-2d regs: %5.1f%% instrs fit (no spill) | "
+                            "collapse %5.1f%% of all ops (%.1f%% of the collapsible)\n",
+                            K,
+                            100.0 * fit / totPress,
+                            100.0 * collapsed / totPress,
+                            totCollapsible ? 100.0 * collapsed / totCollapsible : 0.0);
+                    }
+                }
+
+                // #786 OPCYCLES — observed per-op ns (avg) on this
+                // run.  Only present when NIX_VM_OPCYCLES=1 was set.
+                // Each row: opcode + total ns + count + ns/op.
+                // Note: measurement overhead per dispatch is ~10-20 ns
+                // (one steady_clock + add); subtract that from the
+                // reported ns/op to get the "real" per-op cost.
+                // Relative comparisons across opcodes are unaffected.
+                uint64_t totalCyc = 0;
+                for (size_t i = 0; i < 256; ++i) totalCyc += a.opcycleNs[i];
+                if (totalCyc > 0) {
+                    std::fprintf(stderr,
+                        "v3-direct opcycles (observed per-op ns; "
+                        "~10-20 ns measurement overhead per dispatch):\n");
+                    // Sort by total ns descending.
+                    struct CycRow { uint8_t code; uint64_t ns; uint64_t cnt; };
+                    CycRow crows[256];
+                    size_t nz = 0;
+                    for (size_t i = 0; i < 256; ++i) {
+                        if (a.opcycleNs[i] > 0 && a.opcodeCounts[i] > 0) {
+                            crows[nz++] = { (uint8_t)i,
+                                            a.opcycleNs[i],
+                                            a.opcodeCounts[i] };
+                        }
+                    }
+                    std::sort(crows, crows + nz,
+                        [](const CycRow & x, const CycRow & y) {
+                            return x.ns > y.ns;
+                        });
+                    const size_t topN = std::min<size_t>(12, nz);
+                    for (size_t i = 0; i < topN; ++i) {
+                        std::fprintf(stderr,
+                            "  %-26s total=%llu ns  count=%llu  "
+                            "avg=%6.1f ns/op\n",
+                            opName(static_cast<Op>(crows[i].code)),
+                            (unsigned long long)crows[i].ns,
+                            (unsigned long long)crows[i].cnt,
+                            (double)crows[i].ns / (double)crows[i].cnt);
+                    }
+                    std::fprintf(stderr,
+                        "  -- total measured: %llu ns over %llu ops "
+                        "(avg %.1f ns/op including measurement overhead)\n",
+                        (unsigned long long)totalCyc,
+                        (unsigned long long)totalDispatch,
+                        (double)totalCyc / (double)totalDispatch);
+                }
+
+                // #787 OP_RETURN per-phase breakdown — only present
+                // when NIX_V3_DBG_RETURN_BREAKDOWN=1.  Three phases:
+                // prePop (frame capture + resize + pop), thunkEval
+                // (CFF_THUNK_RETURN logic), postEval (push retVal +
+                // tail-call cleanup + break).  Per-phase counter for
+                // overhead estimate (~10-20 ns × 3 markers = ~50 ns
+                // total per return under the gate).
+                if (a.opReturnThunkCalls + a.opReturnCallCalls > 0) {
+                    uint64_t nT = a.opReturnThunkCalls;
+                    uint64_t nC = a.opReturnCallCalls;
+                    uint64_t nTot = nT + nC;
+                    std::fprintf(stderr,
+                        "v3-direct OP_RETURN breakdown (%llu thunk + %llu call = %llu returns):\n",
+                        (unsigned long long)nT,
+                        (unsigned long long)nC,
+                        (unsigned long long)nTot);
+                    std::fprintf(stderr,
+                        "  prePopNs     total=%llu  avg=%.1f ns/return\n",
+                        (unsigned long long)a.opReturnPrePopNs,
+                        nTot > 0 ? (double)a.opReturnPrePopNs / nTot : 0.0);
+                    std::fprintf(stderr,
+                        "  thunkEvalNs  total=%llu  avg/thunk-return=%.1f ns\n",
+                        (unsigned long long)a.opReturnThunkEvalNs,
+                        nT > 0 ? (double)a.opReturnThunkEvalNs / nT : 0.0);
+                    std::fprintf(stderr,
+                        "  postEvalNs   total=%llu  avg=%.1f ns/return\n",
+                        (unsigned long long)a.opReturnPostEvalNs,
+                        nTot > 0 ? (double)a.opReturnPostEvalNs / nTot : 0.0);
+                    uint64_t bdTotal = a.opReturnPrePopNs
+                                     + a.opReturnThunkEvalNs
+                                     + a.opReturnPostEvalNs;
+                    std::fprintf(stderr,
+                        "  -- breakdown total: %llu ns "
+                        "(subtract ~60 ns/return measurement overhead "
+                        "= ~%lld ns/return real)\n",
+                        (unsigned long long)bdTotal,
+                        nTot > 0
+                            ? (long long)((bdTotal / nTot) - 60)
+                            : 0LL);
+                }
+
+                // #782 bigram top-20 (only when NIX_VM_BIGRAMS=1
+                // was set during eval — non-zero entries reveal
+                // common (prev, current) op-pairs.  Used as the
+                // measurement spike for #780: if >5 % of dispatch
+                // collapses to a handful of bigrams, super-
+                // instructions can capture that without a
+                // full register-VM rewrite.
+                uint64_t totalBigrams = 0;
+                for (size_t i = 0; i < 256; ++i)
+                    for (size_t j = 0; j < 256; ++j)
+                        totalBigrams += a.bigramCounts[i][j];
+                if (totalBigrams > 0) {
+                    struct BigramRow {
+                        uint8_t prev, curr;
+                        uint64_t count;
+                    };
+                    BigramRow brows[256];
+                    size_t bnz = 0;
+                    // Top-20 by count (single pass with insertion).
+                    // 256² = 65 K iterations; cheap.
+                    for (size_t i = 0; i < 256; ++i) {
+                        for (size_t j = 0; j < 256; ++j) {
+                            uint64_t c = a.bigramCounts[i][j];
+                            if (c == 0) continue;
+                            // Insert into sorted brows (keep top 20).
+                            if (bnz < 20) {
+                                brows[bnz++] = { (uint8_t)i, (uint8_t)j, c };
+                            } else {
+                                // Find min and replace if larger.
+                                size_t minIdx = 0;
+                                for (size_t k = 1; k < bnz; ++k)
+                                    if (brows[k].count < brows[minIdx].count)
+                                        minIdx = k;
+                                if (c > brows[minIdx].count)
+                                    brows[minIdx] = { (uint8_t)i, (uint8_t)j, c };
+                            }
+                        }
+                    }
+                    std::sort(brows, brows + bnz,
+                        [](const BigramRow & x, const BigramRow & y) {
+                            return x.count > y.count;
+                        });
+                    std::fprintf(stderr,
+                        "v3-direct bigrams: total=%llu "
+                        "(top-20; #780 super-instruction candidates):\n",
+                        (unsigned long long)totalBigrams);
+                    uint64_t topSum = 0;
+                    for (size_t i = 0; i < bnz; ++i) {
+                        std::fprintf(stderr,
+                            "  %-24s -> %-24s %12llu  %5.2f%%\n",
+                            opName(static_cast<Op>(brows[i].prev)),
+                            opName(static_cast<Op>(brows[i].curr)),
+                            (unsigned long long)brows[i].count,
+                            100.0 * brows[i].count / totalBigrams);
+                        topSum += brows[i].count;
+                    }
+                    std::fprintf(stderr,
+                        "  -- top-20 sum: %5.2f%% of all bigrams "
+                        "(#780 register-VM kill criterion: top-20 < 30%% "
+                        "→ stack motion is spread, not pair-fusible)\n",
+                        100.0 * topSum / totalBigrams);
+                    // #783-measure: same-slot SET_LOCAL -> GET_LOCAL
+                    // (fusion candidate for OP_SET_LOCAL_KEEP).
+                    if (a.bigramSetGetSameSlot > 0) {
+                        std::fprintf(stderr,
+                            "  -- SET_LOCAL -> GET_LOCAL same-slot: %llu "
+                            "(%5.2f%% of all dispatch, "
+                            "%5.2f%% of bigram top-1; "
+                            "#783 OP_SET_LOCAL_KEEP fusion candidate; "
+                            "kill criterion: < 2%% of dispatch)\n",
+                            (unsigned long long)a.bigramSetGetSameSlot,
+                            100.0 * a.bigramSetGetSameSlot / totalDispatch,
+                            // top-1 bigram count = bigramCounts[OP_SET_LOCAL][OP_GET_LOCAL]
+                            (a.bigramCounts[OP_SET_LOCAL][OP_GET_LOCAL] > 0
+                                ? 100.0 * a.bigramSetGetSameSlot
+                                  / a.bigramCounts[OP_SET_LOCAL][OP_GET_LOCAL]
+                                : 0.0));
+                    }
+                }
+
+                // Step-1 (2026-06-04, BYTECODE_NGRAM_ANALYSIS §7)
+                // trigram top-20 — only non-empty when NIX_VM_TRIGRAMS=1
+                // was set during eval.  Execution-weighted confirmation
+                // of the STATIC top n-gram candidates (§4).  THE STEP-1
+                // GATE: proceed to a super-instruction spike (Step 2)
+                // only if the dynamic top-10 trigrams OVERLAP the static
+                // §4 candidates AND the bigram top-20 (printed above) is
+                // ≥ 30%.  Iterates the sparse map (low-thousands of
+                // distinct triples) and keeps the top-20 via the same
+                // insertion scan as the bigram dump.
+                {
+                    const auto & tg = a.trigramCounts;
+                    uint64_t totalTrigrams = 0;
+                    for (const auto & kv : tg) totalTrigrams += kv.second;
+                    if (totalTrigrams > 0) {
+                        struct TrigramRow {
+                            uint8_t a, b, c;
+                            uint64_t count;
+                        };
+                        TrigramRow trows[20];
+                        size_t tnz = 0;
+                        for (const auto & kv : tg) {
+                            uint64_t cnt = kv.second;
+                            uint8_t pa = (uint8_t)((kv.first >> 16) & 0xFF);
+                            uint8_t pb = (uint8_t)((kv.first >> 8)  & 0xFF);
+                            uint8_t pc = (uint8_t)( kv.first        & 0xFF);
+                            if (tnz < 20) {
+                                trows[tnz++] = { pa, pb, pc, cnt };
+                            } else {
+                                size_t minIdx = 0;
+                                for (size_t k = 1; k < tnz; ++k)
+                                    if (trows[k].count < trows[minIdx].count)
+                                        minIdx = k;
+                                if (cnt > trows[minIdx].count)
+                                    trows[minIdx] = { pa, pb, pc, cnt };
+                            }
+                        }
+                        std::sort(trows, trows + tnz,
+                            [](const TrigramRow & x, const TrigramRow & y) {
+                                return x.count > y.count;
+                            });
+                        std::fprintf(stderr,
+                            "v3-direct trigrams: total=%llu distinct=%zu "
+                            "(top-20; Step-1 execution-weighted "
+                            "#780 candidates):\n",
+                            (unsigned long long)totalTrigrams, tg.size());
+                        uint64_t topSum = 0;
+                        for (size_t i = 0; i < tnz; ++i) {
+                            std::fprintf(stderr,
+                                "  %-24s -> %-24s -> %-24s %12llu  %5.2f%%\n",
+                                opName(static_cast<Op>(trows[i].a)),
+                                opName(static_cast<Op>(trows[i].b)),
+                                opName(static_cast<Op>(trows[i].c)),
+                                (unsigned long long)trows[i].count,
+                                100.0 * trows[i].count / totalTrigrams);
+                            topSum += trows[i].count;
+                        }
+                        std::fprintf(stderr,
+                            "  -- top-20 sum: %5.2f%% of all trigrams "
+                            "(Step-1 gate: proceed to super-instruction "
+                            "spike only if dynamic top-10 OVERLAP static "
+                            "§4 candidates AND bigram top-20 >= 30%%)\n",
+                            100.0 * topSum / totalTrigrams);
+                    }
+                }
+            }
+        }
+        // #736 (2026-05-21) IFD-probe summary.  Per IFD_DEEP_DIVE
+        // §8 step 1 falsifier: "dispatcher counts the probes;
+        // counter > 0 on a haskell.nix run".  When ANY probe fired,
+        // emit a one-line breakdown by kind so users can attribute
+        // IFD activity to specific primops without enabling per-call
+        // tracing.  Zero probes = no output (silent on the default
+        // hello.drvPath case where no IFD fires).
+        {
+            uint64_t totalProbes = 0;
+            for (int k = 1; k < (int)kIfdProbeKindCount; ++k)
+                totalProbes += a.ifdProbeCount[k];
+            if (totalProbes > 0) {
+                std::fprintf(stderr, "v3-direct ifd probes: total=%llu",
+                    (unsigned long long)totalProbes);
+                for (int k = 1; k < (int)kIfdProbeKindCount; ++k) {
+                    if (a.ifdProbeCount[k] > 0)
+                        std::fprintf(stderr, " %s=%llu",
+                            ifdProbeKindName(static_cast<uint8_t>(k)),
+                            (unsigned long long)a.ifdProbeCount[k]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+            // #741 Phase 4 measurement spike: per-kind count of primop
+            // calls whose path argument had non-empty string context.
+            // Strict upper bound on potential IFD events (Phase 4
+            // cache candidates).  Zero on workloads that import only
+            // literal nixpkgs paths; non-zero on workloads that touch
+            // derivation outputs (haskell.nix's callCabalProjectToNix
+            // and similar).
+            uint64_t totalWithCtx = 0;
+            for (int k = 1; k < (int)kIfdProbeKindCount; ++k)
+                totalWithCtx += a.ifdProbeWithCtx[k];
+            if (totalWithCtx > 0) {
+                std::fprintf(stderr,
+                    "v3-direct ifd probes (with-ctx, potential IFD): total=%llu",
+                    (unsigned long long)totalWithCtx);
+                for (int k = 1; k < (int)kIfdProbeKindCount; ++k) {
+                    if (a.ifdProbeWithCtx[k] > 0)
+                        std::fprintf(stderr, " %s=%llu",
+                            ifdProbeKindName(static_cast<uint8_t>(k)),
+                            (unsigned long long)a.ifdProbeWithCtx[k]);
+                }
+                std::fprintf(stderr, "\n");
+            } else if (totalProbes > 0) {
+                std::fprintf(stderr,
+                    "v3-direct ifd probes (with-ctx, potential IFD): 0 — "
+                    "all probes were literal-path calls; no IFD candidates\n");
+            }
+            // #795 (2026-05-24): per-call-site v3ToTreeWalker counter.
+            // Dumps which call sites cross to TW most often.  Read by the
+            // V3 true-native investigation (V3_TRUE_NATIVE_PLAN_2026-05-24.md).
+            uint64_t totalV3Tw = 0;
+            for (uint8_t i = 0; i < 16; ++i) totalV3Tw += a.v3ToTwBySite[i];
+            if (totalV3Tw > 0) {
+                static const char * kSiteNames[16] = {
+                    "primReadFile_string_ctx",  // 0
+                    "primReadDir_attrset",      // 1
+                    "primImport_string_ctx",    // 2
+                    "primImport_attrset",       // 3
+                    "primReadDir_string_ctx",   // 4
+                    "primPathExists_ctx",       // 5
+                    "primDerivationStrict_TWfb",// 6
+                    "primV3CallBridge1",        // 7
+                    "FFI_leaves(fetch/path)",   // 8
+                    "v3ToTW_eager_struct",      // 9
+                    "primTrace",                // 10
+                    "primV3ForceAttr_inner",    // 11
+                    "dead_slot_12_was_BP3_force_list_elem",// 12
+                    "site_13",                  // 13
+                    "site_14",                  // 14
+                    "unattributed_other",       // 15
+                };
+                std::fprintf(stderr,
+                    "v3-direct v3ToTreeWalker calls (total=%llu):",
+                    (unsigned long long)totalV3Tw);
+                for (uint8_t i = 0; i < 16; ++i) {
+                    if (a.v3ToTwBySite[i] == 0) continue;
+                    std::fprintf(stderr, " %s=%llu",
+                        kSiteNames[i],
+                        (unsigned long long)a.v3ToTwBySite[i]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        // #741 Phase 1 spike: derivation-result round-trip diagnostics.
+        // Only emits when NIX_V3_TEST_DRV_RESULT_SERIALIZE=1; no output
+        // on the default path.  Validates the value-serialiser
+        // architecture for the multi-week IFD eval-result cache.
+        value_serialize::dumpStats(stderr);
+        // #741 Phase 3a SHADOW eval-result cache diagnostics.
+        // Only emits when NIX_V3_EVAL_RESULT_CACHE=1.
+        value_serialize::dumpEvalResultCacheStats(stderr);
+        // #741 Phase 3e SHADOW drv-hash cache diagnostics.
+        // Only emits when NIX_V3_DRV_HASH_CACHE=1.
+        value_serialize::dumpDrvHashCacheStats(stderr);
+        // #746 (2026-05-21) Bindings-attribution rollup.  Phase 1 of
+        // the post-Stage-4-v4.2 plan: the dominant v3-arena consumer
+        // on hello.drvPath is Bindings (84% / 956 MB).  Until we know
+        // WHERE those Bindings come from we cannot pick the next
+        // lever (persistent-map overlay, construction-site inlining,
+        // or shape polymorphism).
+        //
+        // dumpBindingsAttribution() is a no-op when
+        // NIX_V3_BINDINGS_ATTR is unset; when set, the recording
+        // gate also auto-enables via bindingsOriginEnabled().
+        dumpBindingsAttribution(stderr);
+        // T1.3 (2026-05-27) per-Thunk attribution.  No-op when
+        // NIX_V3_THUNKS_ATTR is unset.  Templated from #746 BINDINGS_ATTR
+        // pattern to identify Thunk allocation hot sites — Thunks are
+        // the second-largest v3_arena bucket on HNE (320 MB / 320 MB-of-
+        // 1594 MB total, per HNE_BUCKET_DECOMP_2026-05-27.md §"v3_arena
+        // decomposition").  Without per-site data Thunks remain the
+        // largest un-attributed bucket after Bindings.
+        dumpThunksAttribution(stderr);
+        // T1.3 (2026-05-27) per-Closure attribution.  No-op when
+        // NIX_V3_CLOSURES_ATTR is unset.  Unlike Thunks (single dominant
+        // site at OP_MAKE_THUNK), Closures are dispersed across ~7 vm.cc
+        // sites — per-site rollup distinguishes "user lambda creation"
+        // from "VM-internal fakeClo wrapping" (the latter is overhead
+        // with potential elision targets).
+        dumpClosuresAttribution(stderr);
+        // T1.3 (2026-05-27) per-Pair + per-List attribution.  Both
+        // have many distinct primops.cc sites; per-site rollup may
+        // surface concrete levers analogous to fakeClo for Closures.
+        // No-op when NIX_V3_PAIRS_ATTR / NIX_V3_LISTS_ATTR unset.
+        dumpPairsAttribution(stderr);
+        dumpListsAttribution(stderr);
+        // T1.3 (2026-05-27) unified cross-type allocation attribution.
+        // Master gate: NIX_V3_ALLOC_ATTR=1.  Aggregates the top sites
+        // across Closures + Thunks + Pairs + Lists into a single
+        // sorted-by-bytes table with a Type column.  Useful overview
+        // of "where the memory is going" without scanning four
+        // separate dumps.
+        dumpAllocAttribution(stderr);
+        // #751 (2026-05-21) "elsewhere" attribution.  After #750 the
+        // v3_arena dropped 386 MB but peak_rss dropped only 248 MB;
+        // the "elsewhere" share (RSS - boehm_heap - v3_arena) grew
+        // from 790 → 928 MB.  Before committing to #748's multi-week
+        // Bindings-overlay work we want to know what's IN that
+        // 928 MB — it might host a bigger lever than the remaining
+        // v3_arena.  This probe dumps the size + estimated byte
+        // footprint of the major C++ containers v3 maintains
+        // outside the threadArena().  Always on under NIX_VM_STATS
+        // (no separate gate — these are cheap reads on shared
+        // counters).
+        {
+            auto estUMap = [](size_t entries, size_t buckets,
+                              size_t keyBytes, size_t valBytes) -> size_t {
+                // Standard unordered_map memory model: bucket array
+                // of pointer-per-bucket + node-per-entry (key + val
+                // + next-pointer + cached-hash).
+                return buckets * sizeof(void *)
+                     + entries * (keyBytes + valBytes
+                                  + 2 * sizeof(void *));
+            };
+            const auto & sct = stringContextSideTable();
+            const auto & pps = posSnapshotPool();
+            const auto & bot = bindingsOriginTable();
+            const auto & cot = cellOwnerTable();
+            const auto & gst = ir::globalSymbolTable();
+            const auto & dirty = dirtyContainers();
+            const auto & standalone = standaloneCellRoots();
+            const auto & nstats = threadNursery().stats();
+            // String-context entry approximates each vector<string>
+            // by entry-count × avg-string-overhead (40 B for a
+            // small std::string node).  Per-entry: pointer-key +
+            // sizeof(vector<string>) header (~24 B).
+            uint64_t sctEntryStrings = 0;
+            uint64_t sctEntryBytes   = 0;
+            for (const auto & kv : sct) {
+                sctEntryStrings += kv.second.size();
+                for (const auto & s : kv.second) sctEntryBytes += s.size();
+            }
+            const size_t sctEst = estUMap(sct.size(), sct.bucket_count(),
+                                          sizeof(const char *),
+                                          sizeof(std::vector<std::string>))
+                                + sctEntryStrings * 40   // string node
+                                + sctEntryBytes;          // string bodies
+            const size_t ppsEst = pps.capacity() * sizeof(PosSnapshot);
+            // PosSnapshot has a std::string; approximate string body
+            // by 1.5× avg-path-length (40 B typical for /nix/store/...).
+            const uint64_t ppsStringBytes = pps.size() * 40;
+            const size_t botEst = estUMap(bot.size(), bot.bucket_count(),
+                                          sizeof(const Bindings *),
+                                          sizeof(BindingsOrigin));
+            const size_t cotEst = estUMap(cot.size(), cot.bucket_count(),
+                                          sizeof(const Value *),
+                                          sizeof(const Thunk *));
+            // Global symbol table: vector<string> + index map.
+            uint64_t gstStringBytes = 0;
+            for (const auto & s : gst) gstStringBytes += s.size();
+            const size_t gstEst = gst.capacity() * sizeof(std::string)
+                                + gstStringBytes
+                                + gst.size() * (24 + 4 + 2 * sizeof(void*));
+            const size_t dirtyEst      = dirty.capacity() * sizeof(DirtyEntry);
+            const size_t standaloneEst = standalone.capacity() * sizeof(void *);
+            // Phase 3 attribution (2026-05-28): account for the
+            // mark-sweep infrastructure that lives outside arena/Boehm.
+            const auto & singletonReg = singletonClosureRegistry();
+            const size_t singletonRegEst =
+                singletonReg.capacity() * sizeof(Closure **);
+            // Arena-side cell-start bitmap.  Per-block bitmap, 128 KB
+            // each.  Lives as long as the arena.
+            size_t cellStartsEst = 0;
+            for (const auto & v : threadArena().cellStartBitmaps())
+                cellStartsEst += v.capacity() * sizeof(uint64_t);
+            // Free list.  Per-bin vector<void*>; many bins for distinct
+            // cell sizes.  Approximate via outer + per-bin capacities.
+            // We don't have public accessors; use a best-effort fixed
+            // estimate based on freeListEntryCount() and assume avg
+            // 8 bytes per entry plus map overhead.
+            const size_t freeListCount = threadArena().freeListEntryCount();
+            const size_t freeListEst =
+                freeListCount * sizeof(void *) * 2;  // entries + map overhead
+            // Nursery: young + (when Phase E active) two survivor
+            // buffers of equal size.  When Phase E is off the
+            // single nursery is just `sizeBytes`.
+            uint64_t nurseryBytes = nstats.sizeBytes;
+            if (threadNursery().isPhaseEActive())
+                nurseryBytes += 2 * nstats.sizeBytes; // approx, S=Y default
+
+            const size_t sumEst = sctEst + ppsEst + ppsStringBytes
+                                + botEst + cotEst + gstEst + dirtyEst
+                                + standaloneEst + nurseryBytes
+                                + singletonRegEst + cellStartsEst + freeListEst;
+            std::fprintf(stderr,
+                "v3-direct elsewhere-probe (entries / est_MB):\n"
+                "  stringContextSide   %12zu  ~%6.1f MB  (buckets=%zu, "
+                "strings=%llu, body=%llu B)\n"
+                "  posSnapshotPool     %12zu  ~%6.1f MB  (capacity=%zu)\n"
+                "  bindingsOriginTable %12zu  ~%6.1f MB  (buckets=%zu)\n"
+                "  cellOwnerTable      %12zu  ~%6.1f MB  (buckets=%zu)\n"
+                "  globalSymbolTable   %12zu  ~%6.1f MB  (capacity=%zu, "
+                "stringBytes=%llu)\n"
+                "  dirtyContainers     %12zu  ~%6.1f MB  (capacity=%zu)\n"
+                "  standaloneCellRoots %12zu  ~%6.1f MB  (capacity=%zu)\n"
+                "  nursery (Y+S buffs) %12s  ~%6.1f MB\n"
+                "  singletonClosureReg %12zu  ~%6.1f MB  (capacity=%zu)\n"
+                "  arena.cellStarts    %12s  ~%6.1f MB  (per-block 128 KB)\n"
+                "  arena.freeList      %12zu  ~%6.1f MB  (live entries)\n"
+                "  ----- elsewhere-probe sum: ~%.1f MB -----\n",
+                sct.size(),         sctEst        / 1e6, sct.bucket_count(),
+                (unsigned long long)sctEntryStrings,
+                (unsigned long long)sctEntryBytes,
+                pps.size(),         (ppsEst + ppsStringBytes) / 1e6,
+                pps.capacity(),
+                bot.size(),         botEst        / 1e6, bot.bucket_count(),
+                cot.size(),         cotEst        / 1e6, cot.bucket_count(),
+                gst.size(),         gstEst        / 1e6, gst.capacity(),
+                (unsigned long long)gstStringBytes,
+                dirty.size(),       dirtyEst      / 1e6, dirty.capacity(),
+                standalone.size(),  standaloneEst / 1e6, standalone.capacity(),
+                "<mmap>",           nurseryBytes  / 1e6,
+                singletonReg.size(), singletonRegEst / 1e6, singletonReg.capacity(),
+                "<phase3>",         cellStartsEst / 1e6,
+                freeListCount,      freeListEst   / 1e6,
+                sumEst / 1e6);
+        }
+        // Step 6 of post-Phase-3.8 plan: free-list hit-rate summary.
+        // Only emitted under NIX_V3_FREE_LIST_STATS=1; otherwise the
+        // counters stayed zero (gate at allocation site).
+        if (std::getenv("NIX_V3_FREE_LIST_STATS") != nullptr) {
+            const auto & fl = freeListStats();
+            const double hitPct = fl.allocCount > 0
+                ? 100.0 * double(fl.hitCount) / double(fl.allocCount)
+                : 0.0;
+            std::fprintf(stderr,
+                "v3-direct free-list stats: "
+                "allocs=%llu hits=%llu hit_rate=%.2f%%\n"
+                "  bin   range_bytes        requests           hits    hit%%\n",
+                (unsigned long long)fl.allocCount,
+                (unsigned long long)fl.hitCount, hitPct);
+            for (size_t b = 0; b < FreeListStats::kNumBins; ++b) {
+                const size_t lo = size_t(16) << b;
+                const size_t hi = size_t(16) << (b + 1);
+                const uint64_t req = fl.requestsByBin[b];
+                const uint64_t hit = fl.hitsByBin[b];
+                if (req == 0 && hit == 0) continue;
+                const double binPct = req > 0
+                    ? 100.0 * double(hit) / double(req) : 0.0;
+                if (b + 1 < FreeListStats::kNumBins) {
+                    std::fprintf(stderr,
+                        "  %2zu   [%6zu,%7zu) %12llu %14llu  %6.2f%%\n",
+                        b, lo, hi,
+                        (unsigned long long)req,
+                        (unsigned long long)hit, binPct);
+                } else {
+                    std::fprintf(stderr,
+                        "  %2zu   [%6zu,    inf) %12llu %14llu  %6.2f%%\n",
+                        b, lo,
+                        (unsigned long long)req,
+                        (unsigned long long)hit, binPct);
+                }
+            }
+            // Pre-committed verdict per task #842 / Step 6 thresholds.
+            const char * verdict;
+            if (hitPct >= 50.0) {
+                verdict = "PER-EXACT-SIZE BINS OK (>=50% — Step 11 NOT justified)";
+            } else if (hitPct < 20.0) {
+                verdict = "PER-EXACT-SIZE BOTTLENECK (<20% — Step 11 fires)";
+            } else {
+                verdict = "JUDGMENT CALL (20-50% — see Step 9 synthesis)";
+            }
+            std::fprintf(stderr,
+                "  ----- free-list verdict: %s\n", verdict);
+        }
+        // Step 12′ of post-Phase-3.8 plan (2026-05-29): Immix
+        // allocator hit-rate stats.  Only emitted under
+        // V3_DBG_IMMIX_ALLOC=1.  Pre-committed acceptance per
+        // task #848: hit rate ≥70% on HNE.
+        if (std::getenv("V3_DBG_IMMIX_ALLOC") != nullptr) {
+            const auto & is = immixAllocStats();
+            const uint64_t served = is.spanHits + is.spanAdvances;
+            const double allocPct = is.allocs > 0
+                ? 100.0 * double(served) / double(is.allocs)
+                : 0.0;
+            const uint64_t totalBytes = is.bytesFromSpans + is.bytesFromBump;
+            const double bytePct = totalBytes > 0
+                ? 100.0 * double(is.bytesFromSpans) / double(totalBytes)
+                : 0.0;
+            std::fprintf(stderr,
+                "v3-direct immix-alloc: "
+                "allocs=%llu spanHits=%llu spanAdvances=%llu "
+                "bumpFresh=%llu\n"
+                "  served-from-spans: %llu (%.2f%% of allocs)\n"
+                "  bytes-from-spans:  %.2f MB (%.2f%% of %.2f MB total)\n",
+                (unsigned long long)is.allocs,
+                (unsigned long long)is.spanHits,
+                (unsigned long long)is.spanAdvances,
+                (unsigned long long)is.bumpFresh,
+                (unsigned long long)served, allocPct,
+                double(is.bytesFromSpans) / (1ULL << 20), bytePct,
+                double(totalBytes) / (1ULL << 20));
+            // Pre-committed verdict per task #848.
+            const char * verdict;
+            if (allocPct >= 70.0) {
+                verdict = "PASS (hit rate ≥70% — Step 12′ acceptance MET)";
+            } else if (allocPct < 30.0) {
+                verdict = "FAIL (hit rate <30% — Step 12′ acceptance MISSED)";
+            } else {
+                verdict = "MARGINAL (30-70% — judgment call)";
+            }
+            std::fprintf(stderr,
+                "  ----- immix-alloc verdict: %s\n", verdict);
+        }
+
+        // Step 18 of post-Phase-3.8 plan (2026-05-29): per-site
+        // allocChars attribution dump.  Only emitted under
+        // NIX_V3_STRINGS_ATTR=1.
+        if (std::getenv("NIX_V3_STRINGS_ATTR") != nullptr) {
+            auto & sites = allocCharsSites();
+            // Sort by bytes descending.
+            std::sort(sites.begin(), sites.end(),
+                [](const AllocCharsSite & a, const AllocCharsSite & b) {
+                    return a.bytes > b.bytes;
+                });
+            uint64_t totalCalls = 0, totalBytes = 0;
+            for (const auto & s : sites) {
+                totalCalls += s.count;
+                totalBytes += s.bytes;
+            }
+            std::fprintf(stderr,
+                "v3-direct allocChars site attribution (Step 18, "
+                "NIX_V3_STRINGS_ATTR=1):\n"
+                "  total: %llu calls / %.2f MB across %zu unique sites\n"
+                "  rank  file:line                                          "
+                "calls       MB    %%cum\n",
+                (unsigned long long)totalCalls,
+                double(totalBytes) / (1ULL << 20),
+                sites.size());
+            uint64_t cumBytes = 0;
+            for (size_t i = 0; i < sites.size() && i < 20; ++i) {
+                const auto & s = sites[i];
+                cumBytes += s.bytes;
+                const double cumPct = totalBytes > 0
+                    ? 100.0 * double(cumBytes) / double(totalBytes) : 0.0;
+                // Truncate file to last 48 chars for readability.
+                const char * f = s.file ? s.file : "?";
+                const size_t flen = std::strlen(f);
+                const char * fshort = flen > 48 ? (f + flen - 48) : f;
+                std::fprintf(stderr,
+                    "  %3zu   %-48s:%-5u %10llu  %7.2f  %5.1f%%\n",
+                    i + 1, fshort, s.line,
+                    (unsigned long long)s.count,
+                    double(s.bytes) / (1ULL << 20),
+                    cumPct);
+            }
+        }
+    }
+    return out;
+}
+
+// PARSER_PROJECT_PLAN §5.3: native parse+lower+run from raw `.nix` source
+// — NO nix::Expr.  The single library entry the CLI (src/nix/eval.cc) and
+// any other top-level caller use, so they needn't pull the parser/cli
+// headers.  `basePath`/`homePath` resolve relative/`~` path literals (as
+// TW's parseExprFromFile/String does); `origin` is the source's
+// PosTable::Origin (Pos::Origin(sp) / Pos::String / Pos::Stdin) so
+// positions match TW.  canLowerV3 is total for parser-produced ASTs, so
+// the throw is a should-never-fire guard.
+// ---------------------------------------------------------------------------
+// TOP-LEVEL RESULT CACHE — v1 SHADOW (task: "#741 done at the right boundary").
+//
+// #741's caches key on FORCED derivation inputs / drvPath (post-computation),
+// so a hit saves only the ~30-50µs libstore tail — measured 0 speedup even at
+// 100% hit (lode/TOPLEVEL_RESULT_CACHE_2026-07-05.md).  The fix is a HIGHER
+// boundary: memoize the TOP-LEVEL expr's forced WHNF result, keyed on inputs
+// computable BEFORE eval (source ‖ NIX_PATH ‖ currentSystem ‖ schema), so an
+// (eventual) ACTIVE hit skips the WHOLE eval (T_hit/T_eval < 0.002).
+//
+// v1 SHADOW: always run, then COMPARE cached-vs-fresh byte-identically and
+// count mismatches.  ZERO risk (never reuses).  The mismatch rate reveals
+// which impure inputs the key misses (→ what to taint) before ACTIVE ships.
+// Gate NIX_V3_TOPLEVEL_CACHE=shadow (default OFF).  Retirement criterion: this
+// SHADOW instrument is folded into an ACTIVE gate once the exit bar
+// (mismatch==0 across hello/firefox/M5/HNE + measured T_hit/T_eval≤0.20) is
+// recorded, OR KILLed if mismatch>0 proves the key cannot be made complete.
+namespace {
+struct TopLevelCacheStats {
+    uint64_t evals = 0, serializable = 0, unserializable = 0, tainted = 0;
+    uint64_t lookups = 0, hits = 0, mismatch = 0, inserts = 0;
+    uint64_t activeHits = 0;  // ACTIVE skip-on-hit: whole pipeline skipped
+};
+TopLevelCacheStats & topLevelCacheStats() { static TopLevelCacheStats s; return s; }
+
+const char * topLevelCacheMode() {
+    static const char * m = [] {
+        const char * e = std::getenv("NIX_V3_TOPLEVEL_CACHE");
+        return e ? e : "";
+    }();
+    return m;
+}
+bool topLevelCacheOn() {
+    const char * m = topLevelCacheMode();
+    return m[0] != '\0' && std::strcmp(m, "0") != 0;
+}
+// ACTIVE (skip-on-hit): "1"/"active".  SHADOW (compare-only): "shadow".
+bool topLevelCacheActive() {
+    const char * m = topLevelCacheMode();
+    return std::strcmp(m, "1") == 0 || std::strcmp(m, "active") == 0;
+}
+
+// -------------------------------------------------------------------------
+// A1 (TOPLEVEL_TAINT_DESIGN_2026-07-06 VETTED SPEC) — offline clock-stability
+// manifest.  A currentTime-tainted top-level result is normally REJECTED (not
+// cached), but the offline perturbation harness (bench/toplevel-cache-
+// coverage.sh) certifies specific (source,NIX_PATH,system,basePath) tuples as
+// byte-stable across >=3 adversarial straddling clocks and emits their ids into
+// a signed manifest.  Production then inserts a clock-ONLY-tainted result iff
+// its id is in the manifest — recovering the corpus win with NO in-process
+// re-run (= nix's flake-eval-cache trust model).
+//
+// The manifest id (Q3) is SHA-256 of the key BODY (schema ‖ system ‖ NIX_PATH ‖
+// basePath ‖ source) — i.e. the key MINUS the version tag / fingerprint /
+// manifest-hash — so production lookup == manifest key BY CONSTRUCTION.
+//
+// FAIL CLOSED (Q4 SINGLE MOST IMPORTANT INVARIANT + R7): env unset, file
+// missing/unreadable, or a malformed line ⇒ empty set ⇒ manifestContains()
+// returns false.  NEVER true on error.  The manifest's content hash is folded
+// into the cache key so any manifest change invalidates clock-tainted entries.
+// -------------------------------------------------------------------------
+namespace toplevel_manifest {
+
+/// Load the manifest once at static init.  Returns the parsed id set (empty on
+/// ANY error) and the raw file bytes (for the content hash), so both derive
+/// from the SAME single read — no TOCTOU between membership and key.
+struct Manifest {
+    std::unordered_set<std::string> ids;
+    std::string rawBytes;
+};
+
+const Manifest & manifest() {
+    static const Manifest m = []() -> Manifest {
+        Manifest out;
+        // A1 test/bring-up hook; retire when the production manifest path is
+        // wired.  This is a RUNTIME gate (selects WHICH clock-stable entries are
+        // blessed), NOT a codegen gate — deliberately NOT in kGates: it changes
+        // no emitted bytecode, only the cache-insert policy, and its identity is
+        // already folded into the key via manifestContentHashHex().
+        const char * path = std::getenv("NIX_V3_TOPLEVEL_MANIFEST");
+        if (!path || path[0] == '\0') return out;  // FAIL CLOSED: no manifest → empty
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return out;                         // FAIL CLOSED: unreadable → empty
+        std::ostringstream buf;
+        buf << f.rdbuf();
+        if (f.bad()) return out;                    // FAIL CLOSED: read error → empty
+        std::string raw = buf.str();
+        // Parse newline-separated 64-hex-char ids; ignore blank lines + '#'
+        // comments.  A malformed (non-64-hex) line FAILS CLOSED for the whole
+        // manifest — a partially-parsed manifest could bless a wrong entry.
+        std::unordered_set<std::string> ids;
+        std::istringstream lines(raw);
+        std::string line;
+        auto isHex64 = [](const std::string & s) {
+            if (s.size() != 64) return false;
+            for (char c : s)
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+            return true;
+        };
+        while (std::getline(lines, line)) {
+            // Strip a trailing '\r' (CRLF-tolerant) but nothing else — an id is
+            // exactly 64 lowercase hex chars with no surrounding whitespace.
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#') continue;  // blank / comment
+            if (!isHex64(line)) return out;                // FAIL CLOSED: malformed
+            ids.insert(line);
+        }
+        out.ids = std::move(ids);
+        out.rawBytes = std::move(raw);
+        return out;
+    }();
+    return m;
+}
+
+/// Membership test — FAILS CLOSED (empty set on any load error → always false).
+bool contains(const std::string & id) {
+    const auto & ids = manifest().ids;
+    return ids.find(id) != ids.end();
+}
+
+/// Hex SHA-256 of the raw manifest file bytes (folded into the cache key so a
+/// manifest change invalidates clock-tainted entries).  If no manifest was
+/// loaded, a fixed 64-char string of '0' (a stable "no manifest" sentinel).
+/// Computed once at static init.
+const std::string & contentHashHex() {
+    static const std::string h = []() -> std::string {
+        const auto & m = manifest();
+        if (m.rawBytes.empty()) return std::string(64, '0');
+        return disk_cache::computeKeyForString(m.rawBytes).hex();
+    }();
+    return h;
+}
+
+} // namespace toplevel_manifest
+
+// =========================================================================
+// A3 (TOPLEVEL_TAINT_DESIGN_2026-07-06 §"A3 VETTED IMPLEMENTATION SPEC", item 2)
+// — flake-lock keying.  A `builtins.getFlake "<ref>"` pins nixpkgs (the ONLY
+// route under --pure-eval), which was TAINT_FETCH → hard-reject → A1's SHIP
+// blocker.  This makes getFlake its own axis (TAINT_GETFLAKE) and, when the
+// flake ref is a STATIC literal in the source, resolves its FULL flake.lock text
+// into the key body so the reject can be DEMOTED to a key input — a lock change
+// then changes the key → MISS-not-stale (never a stale cross-lock serve).
+//
+// A wrong cached result = SILENT WHOLE-EVAL MISCOMPILE via a stale lock, so the
+// literal-ref matcher below is THE dangerous surface (spec risk A3-R1).  It is a
+// DELIBERATELY CONSERVATIVE pre-parse text scan (NOT a real parser): over-
+// rejection is SAFE (falls to the sound hard-reject baseline); under-extraction
+// is a stale-result bug, so the occurrence-count guard MUST err toward reject.
+// =========================================================================
+
+// A3: statically extract `builtins.getFlake "…"` / bare `getFlake "…"` literal
+// refs from `source`.  A clean literal is a double-quoted string with NO `${`
+// (interpolation), NO backslash `\` (escape), terminated by the next `"`.  We do
+// NOT extract `'' … ''` indented strings or interpolated/escaped literals — a
+// getFlake whose ref we cannot pin cleanly must fail the count guard → reject.
+//
+// The matcher scans for the token `getFlake` followed (allowing only whitespace)
+// by a `"` and then a clean literal body.  It intentionally ignores WHERE the
+// token appears (comment/string-body) — soundness is delegated to the count
+// guard (`extractedCount >= tokenCount`), so a getFlake token that does NOT
+// yield a clean literal (comment noise, alias, computed ref) drives the count
+// mismatch that rejects the whole eval.
+struct FlakeRefExtraction {
+    std::vector<std::string> refs;   // clean literal refs, in source-appearance order
+    size_t                   tokenCount = 0;   // coarse count of `getFlake` tokens
+};
+
+static FlakeRefExtraction extractGetFlakeLiterals(const std::string & source) {
+    FlakeRefExtraction out;
+    static const std::string_view kTok = "getFlake";
+    const size_t n = source.size();
+    size_t pos = 0;
+    while (true) {
+        size_t hit = source.find(kTok, pos);
+        if (hit == std::string::npos) break;
+        // Coarse token count: every textual occurrence of `getFlake` (identifier
+        // boundary NOT required — a substring like `myGetFlake` still inflates
+        // the count, which only makes the guard STRICTER = safe).  This is the
+        // denominator the guard compares against; under-counting it would be
+        // unsound, so we count generously.
+        ++out.tokenCount;
+        // Try to read a clean literal ref immediately following the token.  Skip
+        // any run of ASCII whitespace, then require a `"` and a clean body.
+        size_t i = hit + kTok.size();
+        while (i < n && (source[i] == ' ' || source[i] == '\t' || source[i] == '\n'
+                         || source[i] == '\r' || source[i] == '\f' || source[i] == '\v'))
+            ++i;
+        pos = hit + kTok.size();  // default: next search resumes just past the token
+        if (i >= n || source[i] != '"') continue;   // no opening quote → not a clean literal
+        // Read the body up to the next `"`.  REJECT (skip) if we hit `${`
+        // (interpolation), a backslash (escape → the terminating-quote scan is
+        // unreliable for this conservative matcher), or EOF before the close.
+        size_t bodyStart = i + 1;
+        size_t j = bodyStart;
+        bool clean = true;
+        for (; j < n; ++j) {
+            char c = source[j];
+            if (c == '"') break;                          // clean close
+            if (c == '\\') { clean = false; break; }      // escape → not clean
+            if (c == '$' && j + 1 < n && source[j + 1] == '{') { clean = false; break; }  // interpolation
+        }
+        if (!clean || j >= n) continue;   // unterminated / interpolated / escaped → not extracted
+        out.refs.emplace_back(source.substr(bodyStart, j - bodyStart));
+        pos = j + 1;   // resume just past the closing quote
+    }
+    return out;
+}
+
+// A3: the resolved key inputs for one (source, NIX_PATH, system, basePath) tuple,
+// computed ONCE and SHARED by BOTH the key (topLevelCacheKey / manifestEntryId)
+// AND the insert-gate demotion decision.  Sharing is LOAD-BEARING: if the gate
+// demoted GETFLAKE without the lock bytes being in the key (or vice versa) we
+// could serve a result across differing locks.  So `flakeLockFullyKeyed` and the
+// `keyBody` bytes come from the SAME resolution pass.
+struct TopLevelKeyInputs {
+    std::string keyBody;                 // schema‖system‖resolvedNIX_PATH‖basePath‖source‖flakeLocks
+    bool        flakeLockFullyKeyed = false;  // ≥1 clean ref extracted, count guard passed, all locks resolved
+};
+
+// A3: resolve `source`'s getFlake literals to their flake.lock text and build the
+// key body.  fail-closed: ANY failure (count-guard miss, lock exception, dirty
+// input, unlocked-in-pure) leaves flakeLockFullyKeyed=false → GETFLAKE is NOT
+// demoted at the gate → the eval hard-rejects (never a stale cross-lock serve).
+static TopLevelKeyInputs computeTopLevelKeyInputs(nix::EvalState & state,
+                                                  const std::string & source,
+                                                  const std::string & basePath) {
+    TopLevelKeyInputs out;
+    std::string & keyBytes = out.keyBody;
+    keyBytes.reserve(64 + source.size() + basePath.size());
+    uint32_t schema = disk_cache::kEvalResultSchemaVersion;
+    keyBytes.append(reinterpret_cast<const char *>(&schema), sizeof schema);
+    keyBytes.push_back('\0');
+    try { keyBytes.append(ffi::currentSystem(state)); } catch (...) {}
+    keyBytes.push_back('\0');
+    // A3: resolved-NIX_PATH content ids (replaces the raw env string).  Append
+    // `prefix '\0' contentId '\0'` per entry, IN ORDER.  For an UNSOUND entry
+    // (unresolvable or a best-effort non-store path) ALSO emit a fixed
+    // "\x01UNSOUND" marker INTO the contentId slot so an unsound entry is
+    // strictly partitioned — it can never produce the same key bytes as a sound
+    // entry (we never silently treat unsound as sound).  The \x01 leader cannot
+    // occur in a store-path base name or an absolute path, so the partition is
+    // collision-free.
+    try {
+        for (const auto & e : ffi::resolveNixPathContentIds(state)) {
+            keyBytes.append(e.prefix);
+            keyBytes.push_back('\0');
+            keyBytes.append(e.contentId);
+            if (!e.sound) keyBytes.append("\x01UNSOUND");
+            keyBytes.push_back('\0');
+        }
+    } catch (...) {}
+    keyBytes.push_back('\0');
+    keyBytes.append(basePath);
+    keyBytes.push_back('\0');
+    keyBytes.append(source);
+
+    // ---- A3 flake-lock keying (spec item 2) ----------------------------------
+    // Extract clean getFlake literal refs.  Occurrence-count GUARD: if we
+    // extracted FEWER clean literals than there are `getFlake` tokens, some
+    // getFlake could not be statically pinned (let-alias, computed/interpolated
+    // ref, comment/string noise) → fail closed.  Over-rejection is safe.
+    keyBytes.push_back('\0');  // delimit the source from the flake-lock section
+    FlakeRefExtraction ex = extractGetFlakeLiterals(source);
+    bool keyingFailed = false;
+    const bool countGuardPassed = ex.refs.size() >= ex.tokenCount;
+    if (!countGuardPassed) keyingFailed = true;
+    // Demotion requires ≥1 clean literal AND the guard passing; a source with NO
+    // getFlake at all is handled by the gate anyway (mask has no GETFLAKE bit).
+    const bool anyRefs = !ex.refs.empty();
+    // Resolve each extracted ref's flake.lock and append `ref '\0' lockFileStr
+    // '\0'` in source-appearance order.  ANY exception (unlocked-in-pure, parse
+    // error, dirty input) → keyingFailed.
+    const bool pure = ffi::pureEval(state) || ffi::restrictEval(state);
+    if (countGuardPassed) {
+        for (const auto & ref : ex.refs) {
+            try {
+                ffi::LockedFlakeInfo info = ffi::lockFlakeAndRead(state, ref, pure);
+                // Belt: a dirty flake input has NO immutable identity → never
+                // cacheable.  Any node reporting a dirty rev/shortRev poisons the
+                // whole eval.  (Under --pure-eval lockFlakeAndRead already throws
+                // on an unlocked ref; this catches a dirty node that still locked.)
+                bool dirty = false;
+                for (const auto & node : info.nodes) {
+                    if ((node.sourceInfo.dirtyRev && !node.sourceInfo.dirtyRev->empty())
+                     || (node.sourceInfo.dirtyShortRev && !node.sourceInfo.dirtyShortRev->empty())) {
+                        dirty = true; break;
+                    }
+                }
+                if (dirty) { keyingFailed = true; break; }
+                keyBytes.append(ref);
+                keyBytes.push_back('\0');
+                keyBytes.append(info.lockFileStr);  // FULL flake.lock text = complete immutable lock identity
+                keyBytes.push_back('\0');
+            } catch (...) {
+                keyingFailed = true;
+                break;
+            }
+        }
+    }
+    // demote IFF keyed: only when we extracted ≥1 clean ref, the count guard
+    // passed, AND every lock resolved without failure.
+    out.flakeLockFullyKeyed = anyRefs && countGuardPassed && !keyingFailed;
+
+    // V3_DBG_TOPLEVEL_FLAKEKEY test/bring-up hook (retirement-noted): print the
+    // extracted refs + the fully-keyed decision so the A3 fuzz test can assert
+    // the extraction/demotion directly.  RETIRE with the A3 fuzz suite once the
+    // matcher is field-proven.
+    {
+        static const bool s_dbg = std::getenv("V3_DBG_TOPLEVEL_FLAKEKEY") != nullptr;
+        if (s_dbg) {
+            std::fprintf(stderr,
+                "TOPLEVEL flakekey tokens=%zu extracted=%zu guard=%d keyingFailed=%d "
+                "flakeLockFullyKeyed=%d",
+                ex.tokenCount, ex.refs.size(), (int)countGuardPassed, (int)keyingFailed,
+                (int)out.flakeLockFullyKeyed);
+            for (const auto & r : ex.refs) std::fprintf(stderr, " ref=[%s]", r.c_str());
+            std::fprintf(stderr, "\n");
+        }
+    }
+    return out;
+}
+
+// A1: the POST-version-tag key body — schema ‖ currentSystem ‖ resolved-NIX_PATH
+// ‖ basePath ‖ source ‖ flake-locks (exactly the old topLevelCacheKey bytes
+// minus the version tag, extended with the A3 flake-lock section).  Extracted so
+// the manifest id (SHA of THIS) equals the production lookup key body BY
+// CONSTRUCTION (Q3).
+//
+// A3 (2026-07-06): the NIX_PATH slot is no longer the raw `getenv("NIX_PATH")`
+// STRING (sound only for IMMUTABLE pins — a mutable channel symlink is a stable
+// string whose TARGET moves on `nix-channel --update`, so a raw-string key
+// served STALE results across a channel update — the R2 gap).  It is now the
+// RESOLVED content ids of each lookup-path entry, plus the FULL flake.lock text
+// of every statically-extractable getFlake ref (spec item 2).  A channel
+// retarget or a flake.lock bump now changes the key → MISS-not-stale.
+static std::string keyBodyBytes(nix::EvalState & state,
+                                const std::string & source,
+                                const std::string & basePath) {
+    return computeTopLevelKeyInputs(state, source, basePath).keyBody;
+}
+
+// Shared key: (namespace/version ‖ codegenGateFingerprint ‖ manifestContentHash
+// ‖ keyBody).  Computable WITHOUT parsing/evaluating → an ACTIVE hit skips the
+// whole pipeline.
+disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
+                                      const std::string & source,
+                                      const std::string & basePath) {
+    std::string keyBytes;
+    keyBytes.reserve(160 + source.size() + basePath.size());
+    // Namespace + CACHE-POLICY VERSION.  BUMP this whenever the key inputs OR
+    // the impurity-taint / insert policy change — else entries written by an
+    // older binary (different soundness rules) are served by a newer one, a
+    // cross-version cache-poisoning silent-wrong-result (found 2026-07-05: a
+    // pre-taint "v1" getEnv entry was served after taint landed).  v2 = taint on
+    // getEnv/currentTime.  v3 = taint extended to ALL ambient impurities.
+    // v4 (A1, 2026-07-06) = per-axis reject-set + offline clock-stability
+    // manifest INSERT policy; a v3-binary entry used a laxer insert policy →
+    // must never be served by this binary (cross-version poisoning).
+    // v5 (A3, 2026-07-06) = resolved-NIX_PATH content-ids in the key body (was
+    // the raw NIX_PATH string; closes the mutable-channel R2 stale gap).  A v4
+    // entry keyed on the raw NIX_PATH string must NEVER be served by v5.
+    // v6 (A4, 2026-07-06) = flake lockFileStr in the key body + TAINT_GETFLAKE
+    // demotion insert policy.  A v5 entry (getFlake was hard-reject → never
+    // inserted a flake-pinned result, and the key lacked the lock text) must
+    // NEVER be served by v6's flake-keyed insert policy.
+    // v7 = taint mask COMPLETED (import/scopedImport/fetchTree/fetchGit/
+    // fetchMercurial/filterSource/path*/findFile now bump their axis); a v6
+    // entry was written under an incomplete mask that under-tainted file/fetch
+    // reads → must never be served (cross-version stale).
+    keyBytes.append("v3-toplevel-v7");
+    keyBytes.push_back('\0');
+    // R4 (Q5): fold codegenGateFingerprint UNCONDITIONALLY — a differently-
+    // compiled binary (a NIX_V3_* codegen gate set) must never serve a
+    // differently-compiled result.  EMPTY in production (no gates).
+    keyBytes.append(codegenGateFingerprint());
+    keyBytes.push_back('\0');
+    // Q5: fold the manifest content hash UNCONDITIONALLY — a manifest change
+    // (different blessed set) must invalidate the clock-tainted entries it
+    // authorized.  A stable "no manifest" sentinel when unset (one key shape;
+    // the lookup precedes eval, so the taint/insert decision isn't known yet).
+    keyBytes.append(toplevel_manifest::contentHashHex());
+    keyBytes.push_back('\0');
+    keyBytes.append(keyBodyBytes(state, source, basePath));
+    return disk_cache::computeKeyForString(keyBytes);
+}
+
+// A1 (Q3): the manifest id keying a (source,NIX_PATH,system,basePath,flake-lock)
+// tuple — SHA-256 of the key BODY WITHOUT the version tag / fingerprint /
+// manifest-hash, so `contains(manifestEntryId(...))` matches the offline
+// generator's id BY CONSTRUCTION (the generator hashes the same body bytes).
+static std::string manifestEntryId(nix::EvalState & state,
+                                   const std::string & source,
+                                   const std::string & basePath) {
+    return disk_cache::computeKeyForString(keyBodyBytes(state, source, basePath)).hex();
+}
+
+/// v1 SHADOW: serialize the forced WHNF result, key it on pre-eval inputs,
+/// compare against any cached blob (byte-identical), insert if absent.  Never
+/// returns a cached value (shadow) — pure measurement + soundness probe.
+void topLevelCacheShadow(nix::EvalState & state, const std::string & source,
+                         const std::string & basePath, const Value & result) noexcept
+{
+    if (!topLevelCacheOn()) return;
+    auto & st = topLevelCacheStats();
+    ++st.evals;
+    {
+        static const bool s_dbg = std::getenv("V3_DBG_TOPLEVEL") != nullptr;  // TEMP
+        if (s_dbg) std::fprintf(stderr, "  TOPLEVEL eval#%llu tag=%d source=%.50s\n",
+            (unsigned long long)st.evals, (int)result.tag(), source.c_str());
+    }
+    // A1 debug: print the manifest id so the test harness can capture it and
+    // bless the exact tuple.  V3_DBG_TOPLEVEL_MANIFEST_ID test/bring-up hook;
+    // retire when the production manifest path is wired.
+    {
+        static const bool s_dbgId = std::getenv("V3_DBG_TOPLEVEL_MANIFEST_ID") != nullptr;
+        if (s_dbgId) std::fprintf(stderr, "TOPLEVEL manifestEntryId=%s source=%.60s\n",
+            manifestEntryId(state, source, basePath).c_str(), source.c_str());
+    }
+    // Only serializable-WHNF results are cacheable; value_serialize throws on
+    // unforced thunks / closures / functions → natural bypass (counted).
+    //
+    // A1 (TOPLEVEL_TAINT_DESIGN_2026-07-06 VETTED SPEC, Q4) — the INSERT GATE.
+    // A wrong top-level cache = SILENT WHOLE-EVAL MISCOMPILE, so this predicate
+    // is soundness-critical.  ORDER IS LOAD-BEARING:
+    //   1. reject-bits FIRST — any impurity outside the perturbable set
+    //      (readFile/readDir/fetch/store, or getEnv under --impure) HARD-rejects,
+    //      dominating any wrongful manifest bless (TL10).
+    //   2. manifest LAST — an only-perturbable-tainted (clock/env) result caches
+    //      iff it is BLESSED in the offline manifest AND we are under pure-eval.
+    //   3. manifestContains FAILS CLOSED (empty set on any load error → false).
+    // Checked BEFORE serialize so a rejected eval never inserts/compares.
+    {
+        const uint32_t mask = topLevelTaintMask();
+        // Q1: under pure/restricted eval, getEnv returns "" UNCONDITIONALLY
+        // (primops.cc:1865) → env-independent BY CONSTRUCTION, so getEnv is
+        // perturbable-and-recoverable; under --impure it reads the real env
+        // (not in the key) → DEMOTED to reject.  currentTime is always
+        // perturbable (recoverable via the >=3-clock manifest).
+        const bool pure = ffi::pureEval(state) || ffi::restrictEval(state);
+        const uint32_t perturbable = TAINT_CURRENTTIME | (pure ? TAINT_GETENV : 0u);
+        // A3/A4 (spec item 2, DEMOTION): compute the key inputs ONCE and SHARE
+        // — the manifest id AND the GETFLAKE demotion decision BOTH derive from
+        // this SAME resolution pass, so we can never key without demoting (serve
+        // across locks) nor demote without keying (stale cross-lock serve).
+        const TopLevelKeyInputs ki = computeTopLevelKeyInputs(state, source, basePath);
+        // LOAD-BEARING INVARIANT — demote IFF keyed: clear TAINT_GETFLAKE from
+        // the reject-set ONLY when `flakeLockFullyKeyed` (the EXACT flake.lock
+        // text of every statically-extractable getFlake ref is in the key body).
+        // A non-extractable getFlake (let-alias / computed / interpolated ref, or
+        // a dirty/unlocked input) → flakeLockFullyKeyed=false → GETFLAKE stays a
+        // reject bit → hard reject.  We ALSO require `pure` for the demotion
+        // (A3-R4): under --pure-eval lockFlake uses useRegistries=false + the
+        // unlocked-ref guard, so the lock is deterministic + immutable; under
+        // --impure a registry entry can drift the ref out from under a stable
+        // key, so getFlake stays a reject bit there.
+        const uint32_t keyedDemotable =
+            (ki.flakeLockFullyKeyed && pure) ? TAINT_GETFLAKE : 0u;
+        const uint32_t rejectBits = mask & ~(perturbable | keyedDemotable);
+        bool insertable;
+        if (rejectBits != 0)
+            insertable = false;                       // hard reject (checked FIRST)
+        else if ((mask & perturbable) == 0)
+            insertable = true;                        // untainted (or only GETFLAKE-keyed)
+        else
+            insertable = pure                         // only-perturbable + blessed + pure
+                      && toplevel_manifest::contains(
+                             disk_cache::computeKeyForString(ki.keyBody).hex());
+        if (!insertable) { ++st.tainted; return; }
+    }
+    std::string blob;
+    try { value_serialize::serialize(result, blob); }
+    catch (const std::exception & e) {
+        ++st.unserializable;
+        static const bool s_dbg = std::getenv("V3_DBG_TOPLEVEL") != nullptr;  // TEMP
+        if (s_dbg) std::fprintf(stderr, "  TOPLEVEL unserializable: tag=%d why=%s\n",
+            (int)result.tag(), e.what());
+        return;
+    }
+    catch (...) { ++st.unserializable; return; }
+    ++st.serializable;
+    auto key = topLevelCacheKey(state, source, basePath);
+    ++st.lookups;
+    auto existing = disk_cache::lookupEvalResult(key);
+    if (existing) {
+        ++st.hits;
+        // Byte-compare fresh vs cached (serialize is deterministic — sorted
+        // attrs + sorted string context, per canonicalHash's contract).  A
+        // mismatch means the key MISSES an input the result depends on
+        // (impurity / unpinned search path) — the soundness signal.
+        if (*existing != blob) {
+            ++st.mismatch;
+            std::fprintf(stderr,
+                "v3 TOPLEVEL-CACHE SHADOW MISMATCH: differing result under a "
+                "matching key (source prefix: %.60s)\n", source.c_str());
+        }
+    } else {
+        disk_cache::insertEvalResult(key, blob);
+        ++st.inserts;
+    }
+}
+void dumpTopLevelCacheStats() noexcept {
+    const auto & s = topLevelCacheStats();
+    if ((s.evals == 0 && s.activeHits == 0) || !topLevelCacheOn()) return;
+    std::fprintf(stderr,
+        "v3 TOPLEVEL-CACHE (%s): evals=%llu serializable=%llu "
+        "unserializable=%llu tainted=%llu lookups=%llu hits=%llu mismatch=%llu "
+        "inserts=%llu activeHits=%llu\n",
+        topLevelCacheActive() ? "active" : "shadow",
+        (unsigned long long)s.evals, (unsigned long long)s.serializable,
+        (unsigned long long)s.unserializable, (unsigned long long)s.tainted,
+        (unsigned long long)s.lookups, (unsigned long long)s.hits,
+        (unsigned long long)s.mismatch, (unsigned long long)s.inserts,
+        (unsigned long long)s.activeHits);
+}
+
+// WS-2 V2 (2026-07-13): default-on end-of-eval IFD visibility.  Emits ONE (or
+// two) stderr lines when the eval touched any IFD candidate — so CI SEES IFD
+// activity without enabling any diagnostic — and is SILENT otherwise (the
+// common pure-eval / `nix build` case: no context-bearing reads → nothing
+// printed).  The line goes to stderr DURING eval, before the CLI writes the
+// result value to stdout, so value-capturing callers (`… | tail -1`) are
+// unaffected.  v3 measures candidate counts + realise-blocked wall-time
+// unconditionally; the per-derivation built/substituted/ms detail still
+// requires `--option profile-import-from-derivation true` (which populates
+// nrIFDs/totalIFDTime — those are private EvalState members populated only
+// under that setting, and NIX_SHOW_STATS already emits them, so V2 stays
+// purely v3-native and points there for the per-derivation detail).
+static void emitIfdEndOfEvalSummary(std::chrono::steady_clock::time_point wallStart)
+{
+    const auto & a = allocStats();
+    uint64_t candidates = 0;
+    for (int k = 1; k < (int) kIfdProbeKindCount; ++k)
+        candidates += a.ifdProbeWithCtx[k];
+    // Only real IFD activity triggers output: context-bearing IFD-class reads
+    // or timed context-bearing realises.  Plain source-file reads (no context)
+    // never count, so a pure eval / `nix build` stays silent.
+    if (candidates == 0 && a.ifdRealiseCalls == 0)
+        return;
+
+    double blockedS = (double) a.ifdRealiseNanos / 1e9;
+    double wallS = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - wallStart).count();
+    double pct = wallS > 0.0 ? 100.0 * blockedS / wallS : 0.0;
+
+    std::string kinds;
+    for (int k = 1; k < (int) kIfdProbeKindCount; ++k)
+        if (a.ifdProbeWithCtx[k] > 0) {
+            kinds += " ";
+            kinds += ifdProbeKindName(static_cast<uint8_t>(k));
+            kinds += "=";
+            kinds += std::to_string((unsigned long long) a.ifdProbeWithCtx[k]);
+        }
+
+    std::fprintf(stderr,
+        "v3: IFD — %llu context-bearing IFD-class read(s):%s; "
+        "blocked %.3fs in realise across %llu call(s) (%.1f%% of %.3fs eval wall). "
+        "Per-derivation build/substitute/ms detail: "
+        "--option profile-import-from-derivation true\n",
+        (unsigned long long) candidates,
+        kinds.empty() ? " (none)" : kinds.c_str(),
+        blockedS, (unsigned long long) a.ifdRealiseCalls, pct, wallS);
+}
+} // namespace
+
+RootResult runRootExprFromString(nix::EvalState & state, const std::string & source,
+                                 const std::string & basePath, const std::string & homePath,
+                                 const nix::SourcePath * originPath)
+{
+    registerBuiltinPrimOps();  // before lowering (lower-time findPrimOp)
+    // WS5-B2 — adopt the AOT canonical symbol/pos id assignment NOW, before the
+    // root expr is lowered below (the first symbol-interning event).  init() is
+    // idempotent (does its work once, on the first call) and a near-no-op when
+    // NIX_V3_AOT_CACHE_FILE is unset, so calling it at every (incl. nested)
+    // entry is free.  Placing it here — ahead of lowerV3Ast — is what lets the
+    // reader's own interns land on the writer's canonical ids, so borrowed CU
+    // code stays un-rewritten (Shared_Clean).  See aot_cache::init.
+    aot_cache::init();
+    // Re-entry depth: runRootExprModule installs bytecode primops via NESTED
+    // runRootExprFromString calls; the top-level cache acts ONLY on the
+    // outermost (the user's actual expr), never the installer sub-evals.
+    static thread_local int s_rrDepth = 0;
+    struct DepthGuard { int & d; ~DepthGuard() { --d; } } _dg{s_rrDepth};
+    ++s_rrDepth;
+    // WS-2 V2: outermost eval wall-clock start, for the default-on IFD summary
+    // ("blocked X.Xs = Y% of eval wall").  Captured per-invocation; only the
+    // depth-1 frame's span covers the whole eval (incl. nested imports).
+    auto _v2WallStart = std::chrono::steady_clock::now();
+    // Top-level result cache — ACTIVE pre-run lookup (skip-on-hit).  Keyed on
+    // inputs computable BEFORE parsing (source ‖ NIX_PATH ‖ system ‖ schema),
+    // so a hit skips the WHOLE pipeline (parse+lower+run).  SOUND: only
+    // UNTAINTED results were inserted (the taint gates insert, post-run below),
+    // so any cached entry is a pure function of the key → safe to reuse.  The
+    // cached value is a fully-serialized WHNF (deserialize allocates its string
+    // payloads in the arena, independent of a CU), so a minimal CompilationUnit
+    // suffices for the caller's synthetic frame (it only forces the WHNF value,
+    // never runs cu code).  Shadow mode does NOT skip (validates via post-run
+    // compare).  Outermost only.
+    if (s_rrDepth == 1 && topLevelCacheActive()) {
+        auto key = topLevelCacheKey(state, source, basePath);
+        if (auto blob = disk_cache::lookupEvalResult(key)) {
+            try {
+                Value cached = value_serialize::deserialize(*blob);
+                auto & st2 = topLevelCacheStats();
+                ++st2.lookups; ++st2.hits; ++st2.activeHits;
+                dumpTopLevelCacheStats();
+                return RootResult{ std::make_unique<CompilationUnit>(), cached };
+            } catch (...) { /* deserialize failed → fall through to full eval */ }
+        }
+    }
+    nix::v3::ast::ParserState st;
+    st.basePath = basePath;
+    st.homePath = homePath;
+    nix::v3::parser::parseString(st, source);
+    if (!canLowerV3(st.result))
+        throw nix::Error("v3: native lowering cannot handle this expression");
+    // Build the position origin: a file (Pos::Origin(*originPath)) when
+    // given, else an in-memory string.  Done here so run.hh's signature
+    // carries no `nix/...` position type.
+    auto origin = originPath
+        ? ffi::positions(state).addOrigin(nix::Pos::Origin(*originPath), source.size())
+        : ffi::positions(state).addOrigin(
+              nix::Pos::String{.source = nix::make_ref<std::string>(source)}, source.size());
+    auto module = lowerV3Ast(ffi::symbols(state), st.result, &ffi::positions(state), origin,
+                             &twBaseEnvGlobals(state));
+    // Re-entry depth: runRootExprModule installs bytecode primops by running
+    // their bodies via NESTED runRootExprFromString calls (returning function
+    // closures — tag 9, unserializable noise).  Shadow ONLY the OUTERMOST call
+    // (the user's actual top-level expr), not the installer sub-evals.
+    // (taint reset happens inside runRootExprModule, right before run() — after
+    // the primop installer, which calls currentTime.  See there.)
+    auto rr = runRootExprModule(state, std::move(module));
+    // Top-level result cache v1 SHADOW (default-off): measure hit rate +
+    // soundness of memoizing this whole eval keyed on (source ‖ NIX_PATH ‖
+    // system ‖ schema).  Never reuses; see topLevelCacheShadow.
+    if (s_rrDepth == 1) {
+        topLevelCacheShadow(state, source, basePath, rr.value);
+        dumpTopLevelCacheStats();  // after the main shadow (self-gates)
+        emitIfdEndOfEvalSummary(_v2WallStart);  // WS-2 V2 (default-on, silent at 0 IFDs)
+    }
+    return rr;
+}
+
+// Synthetic-source overload (no path literals): builds a Pos::String
+// origin (originPath = null) + empty base/home so callers (the
+// bytecode-primop installer) needn't touch eval.hh / parser / position
+// headers.
+RootResult runRootExprFromString(nix::EvalState & state, const std::string & source)
+{
+    return runRootExprFromString(state, source, /*basePath*/ "", /*homePath*/ "",
+                                 /*originPath*/ nullptr);
+}
+
+} // namespace nix::v3

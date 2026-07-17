@@ -1,0 +1,444 @@
+/* v3 parser Stage 1.4 — grammar grow (Tier 1: expression core).
+ *
+ * PARSER_PROJECT_PLAN_2026-06-01.md §2 (Stage 1.4).  Grows the Stage 1.3
+ * toolchain spike into the real parser by transcribing parser.y's
+ * expression-core productions VERBATIM (same precedence declarations,
+ * same productions) and rewriting only the action bodies to emit the v3
+ * AST via the v3 ParserState.  Keeping the grammar structure identical
+ * preserves parser.y's `%expect 0` conflict-freedom.
+ *
+ * Tier 1 coverage: integer/float literals, variables, the full operator
+ * precedence tier (incl. the `<`/`>`/`<=`/`>=` -> __lessThan and unary
+ * `-` -> `__sub 0` desugarings), function application (flattened via
+ * makeCall), attribute selection (`.` + `or` default), has-attr (`?`),
+ * simple lambda (`x: body`), and `if/then/else`.  This validates against
+ * the 49-fixture operator-precedence battery
+ * (test/parser-ti/fixtures/precedence).
+ *
+ * Tier 2+ (subsequent commits) add: strings + antiquotation, paths,
+ * indented strings, attrsets/binds (via addAttr), lists, let/with/assert,
+ * formals (via validateFormals), pipe operators, dynamic attr keys.
+ *
+ * Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
+ *   Input Output Group.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+%skeleton "lalr1.cc"
+%require "3.0"
+%define api.namespace { nix::v3::parser }
+%define api.parser.class { Parser }
+%define api.value.type variant
+%define api.location.type { nix::v3::ast::ParserLoc }
+%locations
+%define parse.error detailed
+%parse-param { void * scanner }
+%parse-param { nix::v3::ast::ParserState * state }
+%lex-param { void * scanner }
+%expect 0
+
+%code requires {
+  // bison emits switch statements over the full symbol-kind enum with a
+  // default: case; silence -Wswitch-enum for the generated code (matches
+  // the real parser.y:17-19).  Push without pop.
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wswitch-enum"
+
+  #include "v3/ast/expr.hh"
+  #include "parser-state.hh"
+  #include <vector>
+  #include <string>
+  typedef void * yyscan_t;
+
+  // Track byte offsets only (parser.y:43-56); line/column are derived
+  // lazily by the PosTable at eval time.  @$ spans @1..@N.
+  # define YYLLOC_DEFAULT(Current, Rhs, N)                          \
+      do                                                            \
+        if (N) {                                                    \
+          (Current).beginOffset = YYRHSLOC(Rhs, 1).beginOffset;     \
+          (Current).endOffset   = YYRHSLOC(Rhs, N).endOffset;       \
+        } else {                                                    \
+          (Current).beginOffset = (Current).endOffset =             \
+            YYRHSLOC(Rhs, 0).endOffset;                             \
+        }                                                           \
+      while (0)
+}
+
+%code {
+  #include "v3-parser-tab.hh"
+  int yylex(nix::v3::parser::Parser::value_type * yylval,
+            nix::v3::parser::Parser::location_type * yylloc, yyscan_t scanner);
+  using namespace nix::v3::ast;
+}
+
+/* Token value types (mirror parser.y). */
+%token <std::string> ID   "identifier"
+%token <std::string> STR  "string"
+%token <nix::v3::ast::IndStr> IND_STR "indented string"
+%token IND_STRING_OPEN "start of an indented string"
+%token IND_STRING_CLOSE "end of an indented string"
+%token <std::string> PATH "path"
+%token <std::string> HPATH "'~/…' path"
+%token <std::string> SPATH "'<…>' path"
+%token <std::string> URI "URI"
+%token PATH_END "end of path"
+%token <int64_t>     INT_LIT   "integer"
+%token <double>      FLOAT_LIT "float"
+%token DOLLAR_CURLY "'${'"
+%token IF "'if'" THEN "'then'" ELSE "'else'"
+%token ASSERT "'assert'" WITH "'with'" LET "'let'" IN_KW "'in'" REC "'rec'"
+%token INHERIT "'inherit'"
+%token ELLIPSIS "'...'"
+%token OR_KW "'or'"
+%token EQ "'=='" NEQ "'!='" LEQ "'<='" GEQ "'>='"
+%token UPDATE "'//'" CONCAT "'++'" AND "'&&'" OR "'||'" IMPL "'->'"
+%token PIPE_FROM "'<|'" PIPE_INTO "'|>'"
+
+%type <nix::v3::ast::Node *> expr expr_function expr_if expr_op
+%type <nix::v3::ast::Node *> expr_app expr_select expr_simple
+%type <nix::v3::ast::Node *> expr_pipe_from expr_pipe_into
+%type <nix::v3::ast::Attrs *> binds binds1
+%type <std::vector<nix::v3::ast::Node *>> list
+%type <nix::v3::ast::Node *> string_parts string_attr path_start
+%type <std::vector<nix::v3::ast::Node *>> string_parts_interpolated
+%type <std::vector<nix::v3::ast::ParserState::IndStringSegment>> ind_string_parts
+%type <std::vector<nix::v3::ast::AttrName>> attrpath
+%type <std::vector<std::pair<std::string, nix::v3::ast::Pos>>> attrs
+%type <std::string> attr
+%type <nix::v3::ast::FormalsBuilder> formals formal_set
+%type <nix::v3::ast::FormalsBuilder::PFormal> formal
+
+/* Precedence — transcribed verbatim from parser.y:208-219. */
+%right IMPL
+%left OR
+%left AND
+%nonassoc EQ NEQ
+%nonassoc '<' '>' LEQ GEQ
+%right UPDATE
+%left NOT
+%left '+' '-'
+%left '*' '/'
+%right CONCAT
+%nonassoc '?'
+%nonassoc NEGATE
+
+%%
+
+start
+  : expr { state->result = $1; }
+  ;
+
+expr
+  : expr_function
+  ;
+
+expr_function
+  : ID ':' expr_function { $$ = state->add<Lambda>($1, $3); }
+  | formal_set ':' expr_function {
+      state->validateFormals($1);
+      $$ = state->add<Lambda>(state->buildFormals($1), $1.ellipsis, std::string(""), $3);
+    }
+  | formal_set '@' ID ':' expr_function {
+      state->validateFormals($1, 0, $3);
+      $$ = state->add<Lambda>(state->buildFormals($1), $1.ellipsis, $3, $5);
+    }
+  | ID '@' formal_set ':' expr_function {
+      state->validateFormals($3, 0, $1);
+      $$ = state->add<Lambda>(state->buildFormals($3), $3.ellipsis, $1, $5);
+    }
+  | ASSERT expr ';' expr_function { $$ = state->add<Assert>($2, $4); }
+  | WITH expr ';' expr_function   { $$ = state->add<With>($2, $4); }
+  | LET binds IN_KW expr_function {
+      // TW rejects truly-dynamic keys in `let` at parse time
+      // (parser.y:270).  `${"a"}` (plain string) is static and allowed;
+      // `${"a" + ""}` / `${e}` land in dynamicAttrs and are rejected.
+      if (!$2->dynamicAttrs.empty())
+          throw ParseError("dynamic attributes not allowed in let", 0);
+      $$ = state->add<Let>($2, $4);
+    }
+  | expr_if
+  ;
+
+/* formals (parser.y:586-612).  `formal_set` is the `{ … }` argument
+ * pattern; the `{`-attrset-vs-formal-set disambiguation is resolved by
+ * LALR(1) lookahead (the `:`/`@` after `}` for the empty case; `=`/`.`
+ * vs `,`/`?`/`}` after the first ID otherwise) — transcribed verbatim
+ * so `%expect 0` is preserved. */
+formal_set
+  : '{' formals ',' ELLIPSIS '}' { $$ = std::move($2); $$.ellipsis = true; }
+  | '{' ELLIPSIS '}'             { $$ = FormalsBuilder{}; $$.ellipsis = true; }
+  | '{' formals ',' '}'          { $$ = std::move($2); $$.ellipsis = false; }
+  | '{' formals '}'              { $$ = std::move($2); $$.ellipsis = false; }
+  | '{' '}'                       { $$ = FormalsBuilder{}; }
+  ;
+
+formals
+  : formals ',' formal { $$ = std::move($1); $$.formals.push_back(std::move($3)); }
+  | formal             { $$ = FormalsBuilder{}; $$.formals.push_back(std::move($1)); }
+  ;
+
+formal
+  : ID          { $$ = FormalsBuilder::PFormal{$1, @1.beginOffset, nullptr}; }
+  | ID '?' expr { $$ = FormalsBuilder::PFormal{$1, @1.beginOffset, $3}; }
+  ;
+
+expr_if
+  : IF expr THEN expr ELSE expr { $$ = state->add<If>($2, $4, $6); }
+  | expr_pipe_from
+  | expr_pipe_into
+  | expr_op
+  ;
+
+/* pipe operators (parser.y:287-294).  `a <| b` -> apply a to b
+ * (makeCall(a,b)); `a |> b` -> apply b to a (makeCall(b,a)). */
+expr_pipe_from
+  : expr_op PIPE_FROM expr_pipe_from { $$ = state->makeCall($1, $3); }
+  | expr_op PIPE_FROM expr_op        { $$ = state->makeCall($1, $3); }
+  ;
+
+expr_pipe_into
+  : expr_pipe_into PIPE_INTO expr_op { $$ = state->makeCall($3, $1); }
+  | expr_op        PIPE_INTO expr_op { $$ = state->makeCall($3, $1); }
+  ;
+
+expr_op
+  : '!' expr_op %prec NOT { $$ = state->add<OpNot>($2); }
+  | '-' expr_op %prec NEGATE {
+      $$ = state->add<Call>(state->add<Var>(std::string("__sub")),
+             std::vector<Node *>{ state->add<Int>(0), $2 });
+    }
+  | expr_op EQ expr_op    { $$ = state->add<BinOp>(Kind::OpEq,  "==", $1, $3); }
+  | expr_op NEQ expr_op   { $$ = state->add<BinOp>(Kind::OpNEq, "!=", $1, $3); }
+  | expr_op '<' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__lessThan")),
+             std::vector<Node *>{ $1, $3 });
+    }
+  | expr_op LEQ expr_op {
+      $$ = state->add<OpNot>(
+             state->add<Call>(state->add<Var>(std::string("__lessThan")),
+               std::vector<Node *>{ $3, $1 }));
+    }
+  | expr_op '>' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__lessThan")),
+             std::vector<Node *>{ $3, $1 });
+    }
+  | expr_op GEQ expr_op {
+      $$ = state->add<OpNot>(
+             state->add<Call>(state->add<Var>(std::string("__lessThan")),
+               std::vector<Node *>{ $1, $3 }));
+    }
+  | expr_op AND expr_op    { $$ = state->add<BinOp>(Kind::OpAnd,  "&&", $1, $3); }
+  | expr_op OR expr_op     { $$ = state->add<BinOp>(Kind::OpOr,   "||", $1, $3); }
+  | expr_op IMPL expr_op   { $$ = state->add<BinOp>(Kind::OpImpl, "->", $1, $3); }
+  | expr_op UPDATE expr_op { $$ = state->add<BinOp>(Kind::OpUpdate, "//", $1, $3); }
+  | expr_op '?' attrpath   { $$ = state->add<OpHasAttr>($1, $3); }
+  | expr_op '+' expr_op {
+      // `+` -> 2-element ConcatStrings (parser.y:311).
+      $$ = state->add<ConcatStrings>(std::vector<Node *>{ $1, $3 });
+    }
+  | expr_op '-' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__sub")),
+             std::vector<Node *>{ $1, $3 });
+    }
+  | expr_op '*' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__mul")),
+             std::vector<Node *>{ $1, $3 });
+    }
+  | expr_op '/' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__div")),
+             std::vector<Node *>{ $1, $3 });
+    }
+  | expr_op CONCAT expr_op { $$ = state->add<BinOp>(Kind::OpConcatLists, "++", $1, $3); }
+  | expr_app
+  ;
+
+expr_app
+  : expr_app expr_select { $$ = state->makeCall($1, $2); }
+  | expr_select          { $$ = $1; }
+  ;
+
+expr_select
+  : expr_simple '.' attrpath
+    { $$ = state->add<Select>($1, $3, nullptr); }
+  | expr_simple '.' attrpath OR_KW expr_select
+    { $$ = state->add<Select>($1, $3, $5); }
+  | expr_simple OR_KW
+    { // cursed-or wart (parser.y:341, NixOS/nix#11118): `f or` parses as
+      // `f` applied to a variable named `or`.  The parse-time ambiguity
+      // WARNING is a diagnostic only (doesn't affect the AST/show()), so
+      // it is omitted; the structure Call(f, [Var("or")]) matches TW.
+      $$ = state->add<Call>($1, std::vector<Node *>{ state->add<Var>(std::string("or")) }); }
+  | expr_simple
+  ;
+
+expr_simple
+  : ID {
+      if ($1 == "__curPos") $$ = state->add<PosExpr>(@1.beginOffset);
+      else                  $$ = state->add<Var>($1);
+    }
+  | INT_LIT      { $$ = state->add<Int>($1); }
+  | FLOAT_LIT    { $$ = state->add<Float>($1); }
+  | '"' string_parts '"' { $$ = $2; }
+  | IND_STRING_OPEN ind_string_parts IND_STRING_CLOSE
+    { $$ = state->stripIndentation($2, 0); }
+  | path_start PATH_END { $$ = $1; }
+  | path_start string_parts_interpolated PATH_END {
+      // interpolated path (parser.y:361): ConcatStrings of the path_start
+      // prefix + the interpolated parts.  forceString=false (paths, not
+      // strings — parser.y:363).
+      std::vector<Node *> es;
+      es.push_back($1);
+      for (auto * e : $2) es.push_back(e);
+      $$ = state->add<ConcatStrings>(std::move(es), /*forceString=*/false);
+    }
+  | SPATH {
+      // <nixpkgs> -> (__findFile __nixPath "nixpkgs")  (parser.y:365-371)
+      std::string inner = $1.substr(1, $1.size() - 2);  // strip the < >
+      $$ = state->add<Call>(state->add<Var>(std::string("__findFile")),
+             std::vector<Node *>{ state->add<Var>(std::string("__nixPath")),
+                                  state->add<String>(std::move(inner)) });
+    }
+  | URI {
+      // URL literal (parser.y:372) -> a plain string.  The deprecation
+      // lint is omitted (diagnostic only).
+      $$ = state->add<String>($1);
+    }
+  | '(' expr ')' { $$ = $2; }
+  | REC '{' binds '}' { $3->recursive = true; $$ = $3; }
+  | LET '{' binds '}' {
+      // `let { body = …; … }` desugars to `(rec { … }).body` (parser.y:386).
+      $3->recursive = true;
+      $$ = state->add<Select>($3, std::vector<AttrName>{ AttrName(std::string("body")) }, nullptr);
+    }
+  | '{' binds1 '}'    { $$ = $2; }
+  | '{' '}'           { $$ = state->add<Attrs>(false); }
+  | '[' list ']'      { $$ = state->add<List>(std::move($2)); }
+  ;
+
+/* attrset bindings (parser.y:477-535).  Tier 3-lite: `attrpath = expr;`
+ * (wires ParserState::addAttr).  Tier 3b adds `inherit` / `inherit (e)`
+ * (wires addInherit / addInheritFrom).  Dynamic + string keys in the
+ * inherit name-list are deferred (TW rejects dynamic-in-inherit anyway;
+ * string keys need Tier 3b string_attr).
+ *
+ * N.B. the accumulator is `binds1` for `attrpath =` but `binds` (= maybe
+ * empty) for the INHERIT productions — transcribed exactly from parser.y
+ * so `{ inherit a; }` (no prior bind) parses via empty-binds. */
+binds
+  : binds1
+  | /* empty */ { $$ = state->add<Attrs>(false); }
+  ;
+
+binds1
+  : binds1 attrpath '=' expr ';'
+    { $$ = $1; state->addAttr($1, std::move($2), $4, @2.beginOffset); }
+  | binds INHERIT attrs ';'
+    { $$ = $1;
+      for (auto & [name, p] : $3) state->addInherit($1, name, p);
+    }
+  | binds INHERIT '(' expr ')' attrs ';'
+    { $$ = $1;
+      int idx = (int) $1->inheritFromExprs.size();
+      $1->inheritFromExprs.push_back($4);
+      for (auto & [name, p] : $6) state->addInheritFrom($1, name, idx, p);
+    }
+  | attrpath '=' expr ';'
+    { $$ = state->add<Attrs>(false); state->addAttr($$, std::move($1), $3, @1.beginOffset); }
+  ;
+
+/* inherit name-list (parser.y:520-535).  `attr` = ID/OR_KW names;
+ * `string_attr` = a string key (`inherit "a"; ` / `inherit ${"a"};`):
+ * a plain String literal contributes a STATIC name, anything dynamic
+ * is a TW parse error ("dynamic attributes not allowed in inherit"). */
+attrs
+  : attrs attr { $$ = std::move($1); $$.emplace_back($2, @2.beginOffset); }
+  | attrs string_attr {
+      $$ = std::move($1);
+      if ($2->kind == Kind::String)
+          $$.emplace_back(static_cast<String *>($2)->s, @2.beginOffset);
+      else
+          throw ParseError("dynamic attributes not allowed in inherit", @2.beginOffset);
+    }
+  | /* empty */ { $$ = std::vector<std::pair<std::string, Pos>>{}; }
+  ;
+
+list
+  : list expr_select { $$ = std::move($1); $$.push_back($2); }
+  | /* empty */      { $$ = std::vector<nix::v3::ast::Node *>{}; }
+  ;
+
+/* string literals + interpolation (parser.y:397-412).  A plain string
+ * is a single String; an interpolated one is a ConcatStrings with
+ * forceString=true. */
+string_parts
+  : STR { $$ = state->add<String>($1); }
+  | string_parts_interpolated
+    { $$ = state->add<ConcatStrings>(std::move($1), /*forceString=*/true); }
+  | /* empty */ { $$ = state->add<String>(std::string("")); }
+  ;
+
+string_parts_interpolated
+  : string_parts_interpolated STR
+    { $$ = std::move($1); $$.push_back(state->add<String>($2)); }
+  | string_parts_interpolated DOLLAR_CURLY expr '}'
+    { $$ = std::move($1); $$.push_back($3); }
+  | DOLLAR_CURLY expr '}'
+    { $$ = std::vector<nix::v3::ast::Node *>{ $2 }; }
+  | STR DOLLAR_CURLY expr '}'
+    { $$ = std::vector<nix::v3::ast::Node *>{ state->add<String>($1), $3 }; }
+  ;
+
+/* attrpath (parser.y:537-553): dotted path of static `attr`s and/or
+ * string/dynamic `string_attr`s.  A `string_attr` becomes a static key
+ * iff it is a plain string literal (strAttrName decides). */
+/* path_start (parser.y:414-462): a leading PATH (absolute or relative)
+ * or HPATH (`~/…`).  makePath resolves ABSOLUTE paths (CanonPath) and
+ * defers relative/home resolution (no basePath in the spike). */
+path_start
+  : PATH  { $$ = state->makePath($1, 0); }
+  | HPATH { $$ = state->makePath($1, 0); }
+  ;
+
+/* indented-string body (parser.y:471-474): a sequence of IND_STR chunks
+ * and `${expr}` antiquotations, assembled into the IndStringSegments
+ * that ParserState::stripIndentation dedents. */
+ind_string_parts
+  : ind_string_parts IND_STR
+    { $$ = std::move($1);
+      $$.push_back(ParserState::IndStringSegment{
+        /*isString=*/true, $2.s, $2.hasIndentation, nullptr}); }
+  | ind_string_parts DOLLAR_CURLY expr '}'
+    { $$ = std::move($1);
+      $$.push_back(ParserState::IndStringSegment{
+        /*isString=*/false, std::string(""), false, $3}); }
+  | /* empty */ { $$ = std::vector<ParserState::IndStringSegment>{}; }
+  ;
+
+attrpath
+  : attrpath '.' attr        { $$ = std::move($1); $$.emplace_back($3); }
+  | attrpath '.' string_attr { $$ = std::move($1); $$.push_back(state->strAttrName($3)); }
+  | attr                     { $$ = std::vector<AttrName>{ AttrName($1) }; }
+  | string_attr              { $$ = std::vector<AttrName>{ state->strAttrName($1) }; }
+  ;
+
+attr
+  : ID    { $$ = $1; }
+  | OR_KW { $$ = std::string("or"); }
+  ;
+
+/* string-valued attr key (parser.y:560-563).  `"…"` reuses string_parts
+ * (so `"foo"` => String, `"${e}"` => ConcatStrings); `${e}` is a bare
+ * dynamic key.  strAttrName (in attrpath) maps String=>static,
+ * everything else=>dynamic. */
+string_attr
+  : '"' string_parts '"' { $$ = $2; }
+  | DOLLAR_CURLY expr '}' { $$ = $2; }
+  ;
+
+%%
+
+// With %locations the error callback takes the location (parser.y:124).
+void nix::v3::parser::Parser::error(const location_type & loc, const std::string & msg)
+{
+    throw nix::v3::ast::ParseError("v3 parse error: " + msg, loc.beginOffset);
+}
