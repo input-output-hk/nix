@@ -1,0 +1,382 @@
+From 6cf76b2f8afedc2e5418e342aceaca5d16e12e73 Mon Sep 17 00:00:00 2001
+From: Moritz Angermann <moritz.angermann@iohk.io>
+Date: Sat, 18 Jul 2026 15:40:06 +0700
+Subject: [PATCH] Model B: drive the v3 bytecode VM for flake jobsets (behind
+ NIX_V3_DIRECT_EVAL)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wire nix-eval-jobs' worker to the v3-native accessor surface
+(nix-expr-v3 / include/v3/eval_jobs_api.hh) so v3 owns the heavy flake
+descent while ALL store-side logic stays byte-for-byte unchanged.
+
+Hypothesis killed: "integrating v3 into nix-eval-jobs needs a v3->TW Value
+bridge or a rewrite of the store pipeline." Falsified — Model B: v3 drives
+DISCOVERY + DETECTION + EXTRACTION + RECURSION natively; readDerivation /
+queryMissing / queryCacheStatus / queryInputDrvs / JSON serialization are
+untouched (they key off drvPath + store, not the value).
+
+Gate (mirrors the `nix` CLI):
+  - NIX_V3_DIRECT_EVAL routes flake jobsets through v3; unset falls back to
+    the tree-walker (the original path, unchanged).
+  - NIX_V3_REQUIRE hard-fails if v3 does not engage (no silent fallback).
+
+worker.cc: evaluateFlakeV3 locks the flake (TW, a fetch leaf) to get the
+locked rev-pinned ref, then hands it to v3 getFlake (load-bearing: the exact
+locked ref keeps drvPaths identical). processJobRequest / processDerivationV3
+route descend/detect/childnames/extract through the accessors; setFlakeSettings
+is wired per-worker (like main.cc). drv.cc: Drv::fromV3 builds the value-side
+fields via the accessors and runs the SAME store-side block as fromPackageInfo.
+meson: dependency('nix-expr-v3') + cpp_std=c++23 to match the v3 headers.
+
+Known gaps (documented in-code): --constituents / --apply operate on a TW
+Value and are not wired on the v3 path; only flake jobsets use v3.
+
+Shadow parity (offline nested jobset, 5 jobs incl. recurseForDerivations gating
++ non-derivation ignores): TW vs v3 drvPath/name/system/outputs/meta all
+byte-identical; NIX_V3_REQUIRE proves v3 engaged with no fallback.
+---
+ meson.build     |   8 ++-
+ src/drv.cc      |  65 +++++++++++++++++++++++++
+ src/drv.hh      |  17 +++++++
+ src/meson.build |   1 +
+ src/worker.cc   | 127 ++++++++++++++++++++++++++++++++++++++++++++++--
+ 5 files changed, 214 insertions(+), 4 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index d16ab9a..b02f771 100644
+--- a/meson.build
++++ b/meson.build
+@@ -4,7 +4,9 @@ project(
+   version: '0.1.6',
+   license: 'GPL-3.0',
+   default_options: [
+-    'cpp_std=c++20',
++    # c++23 to match the v3 nix headers (nix-expr-v3 exports -std=c++23);
++    # keeping a single consistent standard avoids a mixed -std across TUs.
++    'cpp_std=c++23',
+     'warning_level=3'
+   ]
+ )
+@@ -19,6 +21,10 @@ nix_expr_dep = dependency('nix-expr', required: true)
+ nix_flake_dep = dependency('nix-flake', required: true)
+ nix_main_dep = dependency('nix-main', required: true)
+ nix_cmd_dep = dependency('nix-cmd', required: true)
++# Model B (NIX_EVAL_JOBS_PATCH_2026-07-18): the v3 bytecode-VM accessor
++# surface (include/v3/eval_jobs_api.hh).  Discovered via pkg-config from the
++# v3 nix's installed prefix (nix-expr-v3.pc).
++nix_expr_v3_dep = dependency('nix-expr-v3', required: true)
+ 
+ subdir('src')
+ 
+diff --git a/src/drv.cc b/src/drv.cc
+index 32e9467..3abc2a4 100644
+--- a/src/drv.cc
++++ b/src/drv.cc
+@@ -32,6 +32,8 @@
+ #include <vector>
+ #include <algorithm>
+ 
++#include <v3/eval_jobs_api.hh>
++
+ #include "drv.hh"
+ #include "eval-args.hh"
+ 
+@@ -241,6 +243,69 @@ auto Drv::fromPackageInfo(std::string &attrPath, nix::EvalState &state,
+     return result;
+ }
+ 
++/* Model B: the value-side fields come from the v3-native accessors; the
++ * store-side block below is IDENTICAL to fromPackageInfo (it only needs the
++ * drvPath + store).  Keeping the two in lockstep is the whole point of
++ * Model B — v3 owns the heavy eval, the store pipeline is untouched. */
++auto Drv::fromV3(std::string &attrPath, nix::EvalState &state,
++                 nix::v3::EvalJobsHandle &v3h, MyArgs &args,
++                 Constituents constituents) -> Drv {
++    auto store = state.store;
++
++    // Value-side: v3 accessors instead of PackageInfo::query{Name,DrvPath,Outputs}.
++    std::map<std::string, std::optional<nix::StorePath>> outputs;
++    for (const auto &[outputName, outPathStr] : nix::v3::outputs(v3h)) {
++        outputs[outputName] = store->parseStorePath(outPathStr);
++    }
++
++    Drv result{
++        .name = nix::v3::name(v3h),
++        .storeDir = store->storeDir,
++        .system = {},
++        .drvPath = store->parseStorePath(nix::v3::drvPath(v3h)),
++        .outputs = std::move(outputs),
++        .neededBuilds = {},
++        .neededSubstitutes = {},
++        .unknownPaths = {},
++        .constituents = std::move(constituents),
++    };
++
++    // ---- store-side block: byte-for-byte identical to fromPackageInfo ----
++    auto localStore = store.dynamic_pointer_cast<nix::LocalFSStore>();
++    const bool canReadDerivation = localStore && !nix::settings.readOnlyMode;
++
++    if (canReadDerivation) {
++        auto drv = localStore->readDerivation(result.drvPath);
++
++        // Use the more precise system from the derivation
++        result.system = drv.platform;
++
++        if (args.checkCacheStatus) {
++            result.cacheStatus = queryCacheStatus(
++                *store, result.outputs, result.neededBuilds,
++                result.neededSubstitutes, result.unknownPaths, drv);
++        }
++
++        if (args.showInputDrvs) {
++            result.inputDrvs = queryInputDrvs(drv);
++        }
++
++        auto drvOptions = derivationOptionsFromStructuredAttrs(
++            *store, drv.env, get(drv.structuredAttrs));
++        result.requiredSystemFeatures =
++            std::optional(drvOptions.getRequiredSystemFeatures(drv));
++    } else {
++        // Read-only / remote store: querySystem replacement.
++        result.system = nix::v3::system(v3h);
++    }
++
++    if (args.meta) {
++        result.meta = nix::v3::meta(v3h);
++    }
++
++    return result;
++}
++
+ namespace nlohmann {
+ 
+ using nix::get;
+diff --git a/src/drv.hh b/src/drv.hh
+index 12b5523..e3c9e86 100644
+--- a/src/drv.hh
++++ b/src/drv.hh
+@@ -24,6 +24,10 @@ class EvalState;
+ struct PackageInfo;
+ } // namespace nix
+ 
++namespace nix::v3 {
++struct EvalJobsHandle; // Model B: v3-native accessor handle (eval_jobs_api.hh)
++} // namespace nix::v3
++
+ struct Constituents {
+     std::vector<std::string> constituents;
+     std::vector<std::string> namedConstituents;
+@@ -40,6 +44,19 @@ struct Drv {
+                                nix::PackageInfo &packageInfo, MyArgs &args,
+                                Constituents constituents = {});
+ 
++    /**
++     * Model B (NIX_EVAL_JOBS_PATCH_2026-07-18): build a Drv from the v3
++     * bytecode VM's current job value via the v3-native accessors
++     * (name/drvPath/outputs/system/meta), then run the SAME store-side block
++     * as fromPackageInfo (readDerivation / queryCacheStatus / queryInputDrvs /
++     * requiredSystemFeatures) byte-for-byte unchanged — those key off the
++     * drvPath + store, not the value.  Used when NIX_V3_DIRECT_EVAL routes a
++     * flake job through v3.
++     */
++    static Drv fromV3(std::string &attrPath, nix::EvalState &state,
++                      nix::v3::EvalJobsHandle &v3h, MyArgs &args,
++                      Constituents constituents = {});
++
+     std::string name;
+     std::string storeDir;
+     std::string system;
+diff --git a/src/meson.build b/src/meson.build
+index 5b8565c..154117b 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -21,6 +21,7 @@ common_deps = [
+   nix_flake_dep,
+   nix_main_dep,
+   nix_cmd_dep,
++  nix_expr_v3_dep,
+ ]
+ 
+ nix_eval_jobs_lib = static_library(
+diff --git a/src/worker.cc b/src/worker.cc
+index aa50337..5161d19 100644
+--- a/src/worker.cc
++++ b/src/worker.cc
+@@ -45,6 +45,9 @@
+ #include <variant>
+ #include <vector>
+ 
++#include <v3/eval_jobs_api.hh>
++#include <v3/primop.hh> // nix::v3::setFlakeSettings (wire flakeSettings for getFlake)
++
+ #include "worker.hh"
+ #include "drv.hh"
+ #include "response.hh"
+@@ -99,6 +102,34 @@ auto evaluateFlake(const nix::ref<nix::EvalState> &state,
+     return flake.toValue(*state).first;
+ }
+ 
++// Model B (NIX_EVAL_JOBS_PATCH_2026-07-18): build the v3 flake root handle.
++//
++// The tree-walker locks the flake and evaluates callFlake/toValue on a
++// nix::Value; here we lock the same flake (a store/fetch leaf — the locking is
++// NOT evaluation, so it stays on TW) to obtain the LOCKED, rev-pinned flakeref,
++// then hand that ref to v3's native `getFlake` so v3 owns the heavy descent.
++// The locked ref is load-bearing: using anything but the exact ref the TW path
++// locked would diverge the drvPaths.
++auto evaluateFlakeV3(const nix::ref<nix::EvalState> &state,
++                     const std::string &releaseExpr,
++                     const nix::flake::LockFlags &lockFlags,
++                     const std::string &selectExpr)
++    -> nix::v3::EvalJobsHandlePtr {
++    auto [flakeRef, fragment, outputSpec] =
++        nix::parseFlakeRefWithFragmentAndExtendedOutputsSpec(
++            nix::fetchSettings, releaseExpr,
++            nix::absPath(std::filesystem::path(".")));
++
++    nix::InstallableFlake flake{{},       state,      std::move(flakeRef),
++                                fragment, outputSpec, {},
++                                {},       lockFlags};
++
++    const std::string lockedRef =
++        flake.getLockedFlake()->flake.lockedRef.to_string();
++
++    return nix::v3::evalFlakeRoot(*state, lockedRef, fragment, selectExpr);
++}
++
+ auto attrPathJoin(nlohmann::json input) -> std::string {
+     return std::accumulate(
+         input.begin(), input.end(), std::string(),
+@@ -279,6 +310,39 @@ auto processDerivation(nix::EvalState &state, nix::Value *value,
+     return Response::Job{std::move(drv), std::move(extraValue)};
+ }
+ 
++// Model B: the v3-native counterpart of processDerivation.  The current job
++// value already lives in the handle's GC-rooted slot (set by descendAttrPath).
++// Mirrors processDerivation + collectAttrsForRecursion, but reads the value
++// via the v3 accessors.
++auto processDerivationV3(nix::EvalState &state, nix::v3::EvalJobsHandle &v3h,
++                         std::string &attrPathS, const nlohmann::json &path,
++                         MyArgs &args) -> Response::Payload {
++    if (!nix::v3::isDerivation(v3h)) {
++        // Not a derivation → discover children to recurse into
++        // (collectAttrsForRecursion's value-side logic).
++        bool recurse = args.forceRecurse || path.empty();
++        auto attrs = nix::v3::childAttrNames(v3h, recurse);
++        if (args.forceRecurse) {
++            recurse = true; // forceRecurse wins over recurseForDerivations
++        }
++        return Response::Attrs{recurse ? std::move(attrs)
++                                       : std::vector<std::string>{}};
++    }
++
++    // NOTE (known gap): --constituents and --apply operate on a tree-walker
++    // nix::Value (coerceToString / callFunction) and are not wired on the v3
++    // path yet; a v3 job carries no constituents / extraValue.  Core discovery,
++    // detection, and extraction are fully v3-native.
++    Constituents constituents{};
++    std::optional<nlohmann::json> extraValue;
++
++    auto drv = Drv::fromV3(attrPathS, state, v3h, args, std::move(constituents));
++
++    registerGCRoot(state, drv, args);
++
++    return Response::Job{std::move(drv), std::move(extraValue)};
++}
++
+ auto initializeRootValue(const nix::ref<nix::EvalState> &state,
+                          nix::Bindings &autoArgs, MyArgs &args)
+     -> nix::Value * {
+@@ -318,7 +382,8 @@ auto shouldRestart(const MyArgs &args) -> bool {
+ 
+ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
+                        nix::AutoCloseFD &toParent, nix::Bindings &autoArgs,
+-                       nix::Value *vRoot, MyArgs &args) -> bool {
++                       nix::Value *vRoot, nix::v3::EvalJobsHandle *v3h,
++                       MyArgs &args) -> bool {
+     /* Wait for the collector to send us a job name. */
+     if (tryWriteLine(toParent.get(), "next") < 0) {
+         return false; // main process died
+@@ -341,6 +406,21 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
+     /* Evaluate it and send info back to the collector. */
+     Response::Payload payload = [&]() -> Response::Payload {
+         try {
++            // Model B: when a v3 handle is present (NIX_V3_DIRECT_EVAL),
++            // v3 owns the descent/detection/extraction.  (autoCallFunction
++            // is a no-op here: flake autoArgs is empty and jobs are attrsets,
++            // not defaulted-arg functions — see the known-gap note.)
++            if (v3h != nullptr) {
++                nix::v3::descendAttrPath(*v3h,
++                                         path.get<std::vector<std::string>>());
++                if (nix::v3::isAttrs(*v3h)) {
++                    return processDerivationV3(state, *v3h, attrPathS, path,
++                                               args);
++                }
++                // We ignore everything that cannot be built
++                return Response::Attrs{{}};
++            }
++
+             auto *vTmp =
+                 nix::findAlongAttrPath(state, attrPathS, autoArgs, *vRoot)
+                     .first;
+@@ -406,12 +486,53 @@ void worker(
+         args.lookupPath, evalStore, nix::fetchSettings, nix::evalSettings);
+     nix::Bindings &autoArgs = *args.getAutoArgs(*state);
+ 
+-    nix::Value *vRoot = initializeRootValue(state, autoArgs, args);
++    // Model B gate (mirrors the `nix` CLI's semantics):
++    //   NIX_V3_DIRECT_EVAL — route flake jobsets through the v3 bytecode VM;
++    //     unset falls back to the tree-walker (byte-for-byte the original path).
++    //   NIX_V3_REQUIRE     — hard-fail if v3 does not engage (no silent TW
++    //     fallback), so CI can prove the v3 path is exercised.
++    const bool v3Direct = std::getenv("NIX_V3_DIRECT_EVAL") != nullptr;
++    const bool v3Require = std::getenv("NIX_V3_REQUIRE") != nullptr;
++
++    nix::v3::EvalJobsHandlePtr v3Handle; // null unless v3 engages
++    nix::Value *vRoot = nullptr;
++
++    if (v3Direct && args.flake) {
++        // Wire libcmd's flakeSettings global into v3's thread-local pointer so
++        // the native builtins.getFlake can lock/read the flake (mirrors the
++        // `nix` CLI's main.cc startup wiring; the worker runs in its own
++        // forked process/thread, so this thread_local set is per-worker).
++        nix::v3::setFlakeSettings(&nix::flakeSettings);
++        try {
++            v3Handle = evaluateFlakeV3(state, args.releaseExpr, args.lockFlags,
++                                       args.selectExpr);
++            std::cerr << "nix-eval-jobs: v3-direct engaged (flake root via "
++                         "builtins.getFlake)\n";
++        } catch (const std::exception &e) {
++            if (v3Require) {
++                throw; // no silent fallback under NIX_V3_REQUIRE
++            }
++            std::cerr << "nix-eval-jobs: v3-direct root eval failed, falling "
++                         "back to the tree-walker: "
++                      << e.what() << '\n';
++            v3Handle.reset();
++        }
++    }
++
++    if (v3Require && !v3Handle) {
++        throw nix::Error(
++            "NIX_V3_REQUIRE=1 but v3-direct did not engage (only flake "
++            "jobsets are supported on the v3 path)");
++    }
++
++    if (!v3Handle) {
++        vRoot = initializeRootValue(state, autoArgs, args);
++    }
+ 
+     LineReader fromReader(fromParent.release());
+ 
+     while (processJobRequest(*state, fromReader, toParent, autoArgs, vRoot,
+-                             args)) {
++                             v3Handle.get(), args)) {
+         // Continue processing jobs until we need to exit
+     }
+ 
+-- 
+2.54.0
+
