@@ -178,6 +178,9 @@ lib_sources = files(
   'ffi.cc',
   'print.cc',
   'run.cc',
+  # Model-B accessor surface for out-of-tree job evaluators (nix-eval-jobs /
+  # Hydra).  See lode/NIX_EVAL_JOBS_PATCH_2026-07-18.md + include/v3/eval_jobs_api.hh.
+  'eval_jobs_api.cc',
   # #698: v3-native callFlake — see lode/V3_NATIVE_CALL_FLAKE_DESIGN_2026-05-20.md
   'v3_call_flake.cc',
   # PERF_TRACE_TOOL_DESIGN_2026-05-20.md: in-process Boehm-heap sampler.
@@ -269,6 +272,8 @@ meson.override_dependency(
 # added on a sibling branch would re-break the out-of-tree build under the
 # curated model.  include/v3/ contains only public headers (`.hh`, incl.
 # ast/), so installing the whole subdir is both correct and future-proof.
+# (This also covers the Model-B accessor header include/v3/eval_jobs_api.hh
+# that nix-eval-jobs links against — no curated-list edit needed.)
 install_subdir(
   'include/v3',
   install_dir : get_option('includedir'),
