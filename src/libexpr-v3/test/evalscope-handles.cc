@@ -226,7 +226,9 @@ static void test_readFile_happy()
     int fd = mkstemp(tmpStr.data());
     CHECK(fd >= 0);
     const char * content = "hello v3 ffi";
-    write(fd, content, std::strlen(content));
+    // GCC+glibc flag a bare write() as -Werror=unused-result; consume + assert
+    // the byte count (correct for a test; byte-id-neutral, darwin unaffected).
+    { ssize_t nw_ = write(fd, content, std::strlen(content)); CHECK(nw_ == (ssize_t) std::strlen(content)); }
     close(fd);
 
     auto result = readFile(spOfPath(tmpStr));

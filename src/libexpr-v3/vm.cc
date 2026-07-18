@@ -77,7 +77,10 @@ namespace {
 [[noreturn]] void v3SignalDiagHandler(int sig, siginfo_t * info, void * /*ucontext*/)
 {
     const char header[] = "\n*** v3 fatal-signal diag (V3_DBG_SIGTRAP=1) ***\n";
-    (void)::write(2, header, sizeof header - 1);
+    // GCC+glibc annotate write() with warn_unused_result and a (void) cast does
+    // NOT suppress -Werror=unused-result there (unlike clang); consume the
+    // result into a [[maybe_unused]] local (byte-id-neutral; darwin unaffected).
+    { [[maybe_unused]] ssize_t wr_ = ::write(2, header, sizeof header - 1); }
 
     char buf[256];
     int n = std::snprintf(buf, sizeof buf,
@@ -85,7 +88,7 @@ namespace {
         sig, info ? info->si_code : 0,
         info ? info->si_addr : nullptr,
         info ? info->si_errno : 0);
-    if (n > 0) (void)::write(2, buf, std::min<int>(n, (int)sizeof buf));
+    if (n > 0) { [[maybe_unused]] ssize_t wr_ = ::write(2, buf, std::min<int>(n, (int)sizeof buf)); }
 
     void * frames[64];
     int nf = ::backtrace(frames, 64);
@@ -116,7 +119,7 @@ struct V3SignalDiagInstaller {
         ::sigaction(SIGBUS,  &sa, nullptr);
         ::sigaction(SIGSEGV, &sa, nullptr);
         const char msg[] = "v3 signal-diag installed (SIGTRAP/SIGBUS/SIGSEGV)\n";
-        (void)::write(2, msg, sizeof msg - 1);
+        { [[maybe_unused]] ssize_t wr_ = ::write(2, msg, sizeof msg - 1); }
     }
 };
 // Static init runs at library load.  Cost on no-env case: one
