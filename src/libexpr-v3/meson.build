@@ -255,26 +255,23 @@ meson.override_dependency(
 )
 
 # Headers (publicly installed for downstream consumers).
-install_headers(
-  files(
-    'include/v3/alloc.hh',
-    'include/v3/bytecode.hh',
-    'include/v3/closure.hh',
-    'include/v3/cu_registry.hh',
-    'include/v3/install.hh',
-    'include/v3/ir.hh',
-    'include/v3/disk_cache.hh',
-    'include/v3/gc.hh',
-    'include/v3/gc-config.hh',
-    'include/v3/limits.hh',
-    'include/v3/primop.hh',
-    'include/v3/print.hh',
-    'include/v3/run.hh',
-    'include/v3/serialize.hh',
-    'include/v3/value.hh',
-    'include/v3/vm.hh',
-  ),
-  subdir : 'v3',
+#
+# Install the ENTIRE include/v3/ tree, not a hand-curated subset.  An
+# OUT-OF-TREE consumer (the flake-packaged `nix` CLI that links nix-expr-v3
+# via -I<dev>/include, or nix-eval-jobs, or the Model-B accessor lib) only
+# sees the installed header set — so it must be able to resolve EVERY
+# transitively-included v3/ header.  A curated `files(...)` list silently
+# under-installs: the in-tree build masks the gap because
+# include_directories('include') exposes every header regardless of the
+# install list, but out-of-tree it fails `fatal error: 'v3/…' file not found`
+# (observed for owned_or_borrowed.hh <- bytecode.hh, nursery.hh <- alloc.hh,
+# and heap_trace.hh included directly by src/nix/main.cc).  Every new header
+# added on a sibling branch would re-break the out-of-tree build under the
+# curated model.  include/v3/ contains only public headers (`.hh`, incl.
+# ast/), so installing the whole subdir is both correct and future-proof.
+install_subdir(
+  'include/v3',
+  install_dir : get_option('includedir'),
 )
 
 # Phase A (2026-07-18): generate + install `nix-expr-v3.pc` so an EXTERNAL
