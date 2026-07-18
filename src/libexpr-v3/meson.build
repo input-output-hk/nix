@@ -178,6 +178,9 @@ lib_sources = files(
   'ffi.cc',
   'print.cc',
   'run.cc',
+  # Model-B accessor surface for out-of-tree job evaluators (nix-eval-jobs /
+  # Hydra).  See lode/NIX_EVAL_JOBS_PATCH_2026-07-18.md + include/v3/eval_jobs_api.hh.
+  'eval_jobs_api.cc',
   # #698: v3-native callFlake — see lode/V3_NATIVE_CALL_FLAKE_DESIGN_2026-05-20.md
   'v3_call_flake.cc',
   # PERF_TRACE_TOOL_DESIGN_2026-05-20.md: in-process Boehm-heap sampler.
@@ -261,6 +264,7 @@ install_headers(
     'include/v3/bytecode.hh',
     'include/v3/closure.hh',
     'include/v3/cu_registry.hh',
+    'include/v3/eval_jobs_api.hh',
     'include/v3/install.hh',
     'include/v3/ir.hh',
     'include/v3/disk_cache.hh',
