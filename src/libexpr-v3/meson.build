@@ -277,6 +277,58 @@ install_headers(
   subdir : 'v3',
 )
 
+# Phase A (2026-07-18): generate + install `nix-expr-v3.pc` so an EXTERNAL
+# build — nix-eval-jobs built as its own flake against the v3 nix — can
+# `dependency('nix-expr-v3')` and link libnixexprv3 + its public v3/ headers.
+#
+# Rule-0 — what this ENABLES / what hypothesis it kills:
+#   Kills "the v3 nix cannot be linked by an out-of-tree libnixexpr embedder."
+#   Today the v3 library is `install: true` with `install_headers(…)` and an
+#   in-tree `meson.override_dependency('nix-expr-v3', …)`, but generates NO
+#   pkg-config file — so an external flake (nix-eval-jobs, the Hydra
+#   evaluator) has no way to discover the installed lib/headers.  The
+#   Phase-C worker patch's `dependency('nix-expr-v3')` is unresolvable until
+#   this `.pc` exists.  This is the prerequisite for the whole
+#   nix-eval-jobs → v3 integration (NIX_EVAL_JOBS_PATCH_2026-07-18.md §3).
+#
+# We mirror the shared `nix-meson-build-support/export/meson.build` helper's
+# pkgconfig.generate() but do NOT `subdir()` it, because that helper ALSO
+# re-issues `meson.override_dependency('nix-expr-v3', …)` — which would (a)
+# collide with the full-link-surface override declared above and (b) propagate
+# only `deps_public*` (empty for v3) instead of the transitive subproject +
+# `deps_other` link surface that the in-tree `nix` CLI depends on.  So we keep
+# the manual override for the in-tree consumer and add ONLY the `.pc` here for
+# out-of-tree consumers.  The two are independent and must both exist.
+#
+# `requires_private` lists the nix-* pkg-config modules libnixexprv3 links
+# (nix-util / nix-store / nix-expr / nix-main / nix-flake); each installs its
+# own `.pc` from the same v3 nix, so an external `pkg-config --exists
+# nix-expr-v3` resolves the whole chain.  toml11 / sqlite3 sit in `deps_other`
+# (already resolved into the dylib at its own link time) and are intentionally
+# not re-listed, matching the export helper.  `-std=c++23` is required to
+# compile against the v3 headers (same as the manual override's compile_args).
+requires_v3_private = []
+foreach dep : deps_private_subproject
+  requires_v3_private += dep.name()
+endforeach
+requires_v3_private += deps_private
+
+requires_v3_public = []
+foreach dep : deps_public_subproject
+  requires_v3_public += dep.name()
+endforeach
+requires_v3_public += deps_public
+
+import('pkgconfig').generate(
+  this_library,
+  filebase : 'nix-expr-v3',
+  name : 'Nix expr v3',
+  description : 'Nix v3 bytecode VM evaluator (libnixexprv3)',
+  extra_cflags : [ '-std=c++23' ],
+  requires : requires_v3_public,
+  requires_private : requires_v3_private,
+)
+
 # Tiny CLI: `v3-eval FILE.nix` — parses, lowers, runs.
 #
 # Bumped stack on darwin to 64 MiB to mirror `src/nix/meson.build`'s
