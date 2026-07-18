@@ -1,18 +1,15 @@
-From 6cf76b2f8afedc2e5418e342aceaca5d16e12e73 Mon Sep 17 00:00:00 2001
+From e9e064b6308b015f326c2c36be7e3e0f22a109b0 Mon Sep 17 00:00:00 2001
 From: Moritz Angermann <moritz.angermann@iohk.io>
-Date: Sat, 18 Jul 2026 15:40:06 +0700
+Date: Sat, 18 Jul 2026 16:07:42 +0700
 Subject: [PATCH] Model B: drive the v3 bytecode VM for flake jobsets (behind
  NIX_V3_DIRECT_EVAL)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
 
 Wire nix-eval-jobs' worker to the v3-native accessor surface
 (nix-expr-v3 / include/v3/eval_jobs_api.hh) so v3 owns the heavy flake
 descent while ALL store-side logic stays byte-for-byte unchanged.
 
 Hypothesis killed: "integrating v3 into nix-eval-jobs needs a v3->TW Value
-bridge or a rewrite of the store pipeline." Falsified — Model B: v3 drives
+bridge or a rewrite of the store pipeline." Falsified -- Model B: v3 drives
 DISCOVERY + DETECTION + EXTRACTION + RECURSION natively; readDerivation /
 queryMissing / queryCacheStatus / queryInputDrvs / JSON serialization are
 untouched (they key off drvPath + store, not the value).
@@ -30,20 +27,46 @@ is wired per-worker (like main.cc). drv.cc: Drv::fromV3 builds the value-side
 fields via the accessors and runs the SAME store-side block as fromPackageInfo.
 meson: dependency('nix-expr-v3') + cpp_std=c++23 to match the v3 headers.
 
+default.nix: add nixComponents.nix-expr-v3 to buildInputs so the `nix build`
+deploy route (--override-input nix <v3-nix>) supplies the component the
+meson dependency('nix-expr-v3') resolves against. The v3 nix flake exposes
+nix-expr-v3 via packaging/components.nix.
+
 Known gaps (documented in-code): --constituents / --apply operate on a TW
 Value and are not wired on the v3 path; only flake jobsets use v3.
 
 Shadow parity (offline nested jobset, 5 jobs incl. recurseForDerivations gating
 + non-derivation ignores): TW vs v3 drvPath/name/system/outputs/meta all
 byte-identical; NIX_V3_REQUIRE proves v3 engaged with no fallback.
+
+Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
+SPDX-License-Identifier: Apache-2.0
 ---
+ default.nix     |   6 +++
  meson.build     |   8 ++-
  src/drv.cc      |  65 +++++++++++++++++++++++++
  src/drv.hh      |  17 +++++++
  src/meson.build |   1 +
  src/worker.cc   | 127 ++++++++++++++++++++++++++++++++++++++++++++++--
- 5 files changed, 214 insertions(+), 4 deletions(-)
+ 6 files changed, 220 insertions(+), 4 deletions(-)
 
+diff --git a/default.nix b/default.nix
+index f607ca6..883fc1b 100644
+--- a/default.nix
++++ b/default.nix
+@@ -34,6 +34,12 @@ stdenv.mkDerivation {
+     nixComponents.nix-store
+     nixComponents.nix-fetchers
+     nixComponents.nix-expr
++    # Model B (NIX_EVAL_JOBS_PATCH_2026-07-18): the v3 bytecode-VM accessor
++    # surface. The v3 nix flake exposes this component via
++    # packaging/components.nix; the meson.build patch's
++    # dependency('nix-expr-v3') resolves against it. Required for the
++    # `nix build --override-input nix <v3-nix>` deploy route.
++    nixComponents.nix-expr-v3
+     nixComponents.nix-flake
+     nixComponents.nix-main
+     nixComponents.nix-cmd
 diff --git a/meson.build b/meson.build
 index d16ab9a..b02f771 100644
 --- a/meson.build
