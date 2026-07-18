@@ -20,6 +20,7 @@
 
   nix-expr,
   nix-expr-c,
+  nix-expr-v3,
   nix-expr-tests,
 
   nix-flake,
@@ -59,6 +60,7 @@ let
       nix-fetchers-c
       nix-expr
       nix-expr-c
+      nix-expr-v3
       nix-flake
       nix-flake-c
       nix-main
@@ -235,6 +237,7 @@ stdenv.mkDerivation (finalAttrs: {
       "nix-cmd"
       "nix-expr"
       "nix-expr-c"
+      "nix-expr-v3"
       "nix-fetchers"
       "nix-fetchers-c"
       "nix-flake"

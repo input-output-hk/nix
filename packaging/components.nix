@@ -405,6 +405,9 @@ in
   nix-fetchers-tests = callPackage ../src/libfetchers-tests/package.nix { };
 
   nix-expr = callPackage ../src/libexpr/package.nix { };
+  # v3 bytecode-VM evaluator (libnixexprv3).  Sibling library wrapping
+  # nix-expr; the nix CLI links it (src/nix/meson.build: dependency('nix-expr-v3')).
+  nix-expr-v3 = callPackage ../src/libexpr-v3/package.nix { };
   nix-expr-c = callPackage ../src/libexpr-c/package.nix { };
   nix-expr-test-support = callPackage ../src/libexpr-test-support/package.nix { };
   nix-expr-tests = callPackage ../src/libexpr-tests/package.nix { };

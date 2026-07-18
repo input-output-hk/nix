@@ -397,6 +397,7 @@
 
               "nix-expr" = { };
               "nix-expr-c" = { };
+              "nix-expr-v3" = { };
               "nix-expr-test-support" = { };
               "nix-expr-tests" = { };
 

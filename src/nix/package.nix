@@ -5,6 +5,7 @@
 
   nix-store,
   nix-expr,
+  nix-expr-v3,
   nix-main,
   nix-cmd,
 
@@ -67,6 +68,10 @@ mkMesonExecutable (finalAttrs: {
   buildInputs = [
     nix-store
     nix-expr
+    # The nix CLI links libnixexprv3 (src/nix/meson.build:
+    # dependency('nix-expr-v3')); without this the flake meson config fails to
+    # resolve the pkg-config dep that the in-tree dev-shell gets as a subproject.
+    nix-expr-v3
     nix-main
     nix-cmd
   ];
