@@ -6955,7 +6955,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     argbuf[A - 1] = arg;
                     const LambdaDescriptor * d = papBase->desc;
                     if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
-                        throw std::runtime_error(
+                        throw CallDepthError(
                             "v3 OP_CALL: stack overflow; call depth exceeded "
                             + std::to_string(kMaxCallDepth));
                     vm.frames.back().ip = ip;
@@ -7758,7 +7758,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // defaults to 5000; we match that via kMaxCallDepth (see
             // anonymous namespace at top of file).  Cheap O(1) check.
             if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
-                throw std::runtime_error("v3 OP_CALL: stack overflow; call depth exceeded "
+                throw CallDepthError("v3 OP_CALL: stack overflow; call depth exceeded "
                                           + std::to_string(kMaxCallDepth));
 
             vm.frames.back().ip = ip;

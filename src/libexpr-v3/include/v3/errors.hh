@@ -60,4 +60,19 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+/// kMaxCallDepth exceeded (OP_CALL depth guard) — v3's analogue of the
+/// tree-walker's `nix::StackOverflowError`.  A DISTINCT type (review A4,
+/// 2026-07-20) so embedders that must mirror the tree-walker's fatality
+/// classification can: nix-eval-jobs marks stack-overflow jobs FATAL
+/// (aborting the whole eval, replicating the historic
+/// fail-on-infinite-recursion behavior), while blackhole-style infinite
+/// recursion stays a per-job error (the tree-walker's plain EvalError).
+/// Previously a bare `std::runtime_error`, which made the two
+/// indistinguishable by type.
+class CallDepthError : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+
 } // namespace nix::v3
