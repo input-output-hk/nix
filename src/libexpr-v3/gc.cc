@@ -46,6 +46,7 @@
 #include "v3/bytecode_primops.hh"  // #705: walkBytecodePrimopRoots, walkBuiltinsRoot
 #include "v3/print.hh"  // Round 1 #7: walkDeepForceRoots
 #include "v3/barrier.hh"  // Phase D: dirty-list + standalone cells
+#include "v3/gc_root.hh"  // Review 2026-07-20: minor scavenge walks the GcRoot registry
 #include "v3/value.hh"
 #include "v3/vm.hh"
 
@@ -1065,6 +1066,26 @@ void Scavenger::run()
     // The scavenger walks the slots so their payload pointers
     // forward correctly across nested scavenges.
     walkDeepForceRoots(rootVisit);
+
+    // Review 2026-07-20 (Model-B accessor audit, finding 1): the C++-stack
+    // GcRoot registry (gc_root.hh — `GcRoot` / `V3_GC_ROOT` / `GcRootRange`
+    // / `GcRootVec`) was walked ONLY by walkAllV3Roots (the gated-off major
+    // GC + audits) — the always-on MINOR scavenge never saw it, making every
+    // GcRoot registration decorative exactly when the moving collector runs.
+    // Long-lived registrations (the eval_jobs_api handle's root/jobValue
+    // slots, held across the out-of-tree worker's whole lifetime) would keep
+    // fromspace addresses across any scavenge fired at exitDepth==0 (e.g. a
+    // --select or --expr root eval running a fresh top-level dispatch while
+    // the handle root is live) → UAF.  Walk + rewrite the registered slots
+    // in place, exactly like the valueStack entries above.  Cost: the
+    // registry is empty or a handful of entries at any scavenge point
+    // (transient primop-body roots cannot be live between opcodes at
+    // exitDepth==0), so this is O(handles), not O(heap).
+    for (Value * p : gcRootStack())
+        if (p) visitValue(*p);
+    for (std::vector<Value> * vec : gcRootVecStack())
+        if (vec)
+            for (Value & v : *vec) visitValue(v);
 
     // #558 Phase 3.3: partialBindingsRegistry retired (no longer
     // referenced by vm.cc).  No scavenge work needed.

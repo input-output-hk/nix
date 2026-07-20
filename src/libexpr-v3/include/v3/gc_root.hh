@@ -71,6 +71,13 @@ struct RootVisitor;
 /// bottom-to-top of the call chain.
 std::vector<Value *> & gcRootStack() noexcept;
 
+/// Returns the calling thread's registered growing-vector roots
+/// (`GcRootVec` registrations).  Exported (review 2026-07-20) so the MINOR
+/// scavenger can walk + rewrite registry entries directly with its own
+/// non-virtual visitValue — `walkCppStackRoots` requires a RootVisitor,
+/// whose per-type callbacks the Scavenger doesn't expose.
+std::vector<std::vector<Value> *> & gcRootVecStack() noexcept;
+
 /// Walk the C++-stack root registry calling `visitor.visitValue(*p)`
 /// for each registered entry whose pointer is non-null.
 ///
