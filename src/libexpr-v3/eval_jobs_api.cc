@@ -94,10 +94,17 @@ std::string escapeNixString(std::string_view s)
 }
 
 /// Split a dot-separated attrPath fragment ("a.b.c") into segments.  Empty
-/// input yields an empty vector.  (Quoted segments — `a."b.c"` — are not
-/// handled; job fragments in practice are simple dotted identifiers.)
+/// input yields an empty vector.  Quoted segments — `a."b.c"` — are NOT
+/// handled (TW's findAlongAttrPath supports them); rather than silently
+/// mis-splitting, THROW so the worker's engagement catch falls back to the
+/// tree-walker (review A5, 2026-07-20).  Job fragments in practice are
+/// simple dotted identifiers; hydra passes no fragment at all.
 std::vector<std::string> splitDot(const std::string & s)
 {
+    if (s.find('"') != std::string::npos)
+        throw nix::Error(
+            "v3 flake root: quoted attrPath fragment segments are "
+            "tree-walker-only: '" + s + "'");
     std::vector<std::string> segs;
     std::string cur;
     for (char c : s) {
@@ -124,10 +131,15 @@ std::string valueToPathString(const Value & v)
 // root eval
 // ---------------------------------------------------------------------------
 
-EvalJobsHandlePtr evalFlakeRoot(nix::EvalState & state,
-                                const std::string & lockedFlakeRef,
-                                const std::string & fragment,
-                                const std::string & selectExpr)
+namespace {
+
+/// Shared core of evalFlakeRoot / evalExprRoot: build the handle, run `src`
+/// through the v3 pipeline, force the root to WHNF, optionally descend a
+/// dotted `fragment`, optionally apply a `--select` lambda.
+EvalJobsHandlePtr makeHandleFromSource(nix::EvalState & state,
+                                       const std::string & src,
+                                       const std::string & fragment,
+                                       const std::string & selectExpr)
 {
     EvalJobsHandlePtr h(new EvalJobsHandle());
     h->vm = std::make_unique<VMState>();
@@ -137,10 +149,6 @@ EvalJobsHandlePtr evalFlakeRoot(nix::EvalState & state,
     h->rootGuard = std::make_unique<GcRoot>(h->root);
     h->jobGuard  = std::make_unique<GcRoot>(h->jobValue);
 
-    // 1. getFlake — the v3-native flake root (byte-identical drvPath to TW's
-    //    callFlake, verified 2026-07-18).  The locked, rev-pinned ref pins
-    //    the content so this resolves to the same flake the caller locked.
-    std::string src = "builtins.getFlake \"" + escapeNixString(lockedFlakeRef) + "\"";
     RootResult rr = runRootExprFromString(state, src);
     h->rootCu = std::move(rr.cu);
 
@@ -154,7 +162,7 @@ EvalJobsHandlePtr evalFlakeRoot(nix::EvalState & state,
 
     h->root = forceValue(*h->vm, rr.value);
 
-    // 2. Fragment descent (`#hydraJobs`, `#packages.aarch64-darwin`, …).
+    // Fragment descent (`#hydraJobs`, `#packages.aarch64-darwin`, …).
     for (const auto & seg : splitDot(fragment)) {
         Value cur = h->root;
         if (!cur.isAttrs() || !cur.asAttrs())
@@ -167,9 +175,9 @@ EvalJobsHandlePtr evalFlakeRoot(nix::EvalState & state,
         h->root = forceValue(*h->vm, *found);
     }
 
-    // 3. --select: evaluate the lambda and apply it to the (post-fragment)
-    //    root; force the result to WHNF (mirrors initializeRootValue's
-    //    callFunction + forceAttrs).
+    // --select: evaluate the lambda and apply it to the (post-fragment)
+    // root; force the result to WHNF (mirrors initializeRootValue's
+    // callFunction + forceAttrs).
     if (!selectExpr.empty()) {
         RootResult sr = runRootExprFromString(state, selectExpr);
         h->selectCu = std::move(sr.cu);
@@ -178,6 +186,56 @@ EvalJobsHandlePtr evalFlakeRoot(nix::EvalState & state,
         h->root = forceValue(*h->vm, applied);
     }
 
+    return h;
+}
+
+} // namespace
+
+EvalJobsHandlePtr evalFlakeRoot(nix::EvalState & state,
+                                const std::string & lockedFlakeRef,
+                                const std::string & fragment,
+                                const std::string & selectExpr)
+{
+    // getFlake — the v3-native flake root (byte-identical drvPath to TW's
+    // callFlake, verified 2026-07-18).  The locked, rev-pinned ref pins
+    // the content so this resolves to the same flake the caller locked.
+    std::string src = "builtins.getFlake \"" + escapeNixString(lockedFlakeRef) + "\"";
+    return makeHandleFromSource(state, src, fragment, selectExpr);
+}
+
+EvalJobsHandlePtr evalExprRoot(nix::EvalState & state,
+                               const std::string & exprSrc,
+                               const std::string & selectExpr)
+{
+    // The `--expr` route — THE shape Hydra actually uses (review 2026-07-20;
+    // hydra-eval-jobset passes `--expr 'let flake = builtins.getFlake
+    // (toString "<locked-url>"); in flake.hydraJobs or flake.checks or
+    // (throw …)'`, never `--flake`).  v3 evaluates the whole expression
+    // natively (getFlake is the sole v3-native impl; `or`/`throw` are
+    // ordinary v3 evaluation).  Hydra pre-locks the URL via `nix flake
+    // metadata`, so drvPath identity is preserved without any
+    // InstallableFlake machinery.
+    EvalJobsHandlePtr h = makeHandleFromSource(state, exprSrc, "", selectExpr);
+
+    // Root-shape guard: the tree-walker's non-flake route auto-calls the
+    // root (releaseExprTopLevelValue → autoCallFunction), which CALLS a
+    // lambda root with all-defaulted formals and unwraps a functor attrset
+    // root.  Those semantics are TW-only — throw so the worker's engagement
+    // catch falls back to the tree-walker for exact parity (an attrset root
+    // — hydra's hydraJobs — is a no-op under autoCallFunction with empty
+    // autoArgs, so v3 proceeds for the production shape).
+    {
+        Value root = h->root;
+        bool needsTw = root.tag() == Tag::Closure;
+        if (!needsTw && root.isAttrs() && root.asAttrs()) {
+            static const SymbolId functorId = ir::globalInternSymbol("__functor");
+            needsTw = root.asAttrs()->lookup(functorId) != nullptr;
+        }
+        if (needsTw)
+            throw nix::Error(
+                "v3 expr root is a function/functor — tree-walker "
+                "autoCallFunction semantics required");
+    }
     return h;
 }
 
@@ -221,14 +279,18 @@ bool isDerivation(EvalJobsHandle & h)
     static const SymbolId typeId = ir::globalInternSymbol("type");
     const Value * t = v.asAttrs()->lookup(typeId);
     if (!t) return false;
-    // `.type` is a literal string in a derivation attrset — forcing it does
-    // not allocate, so `v` cannot move here.
+    // NOTE (comment corrected 2026-07-20): forcing CAN allocate here (a
+    // thunked `.type`, and even `lookup` realises MapAttrs entries).  Safety
+    // does not depend on "no allocation": `*t` is read into forceValue's
+    // by-value argument at call setup, and neither `v` nor `t` is used
+    // after the force — only the returned `tv`.
     Value tv = forceValue(vm, *t);
     return tv.tag() == Tag::String && tv.asString()
         && std::string_view(tv.asString()) == "derivation";
 }
 
-std::vector<std::string> childAttrNames(EvalJobsHandle & h, bool & recurse)
+std::vector<std::string> childAttrNames(EvalJobsHandle & h, bool & recurse,
+                                        bool forceRecurse)
 {
     VMState & vm = *h.vm;
     std::vector<std::string> attrs;
@@ -247,13 +309,62 @@ std::vector<std::string> childAttrNames(EvalJobsHandle & h, bool & recurse)
     std::sort(attrs.begin(), attrs.end());
 
     // recurseForDerivations (value-side part of collectAttrsForRecursion).
-    static const SymbolId rfdId = ir::globalInternSymbol("recurseForDerivations");
-    const Value * rfd = b->lookup(rfdId);       // alloc-free; `b` still valid
-    if (rfd) {
-        Value rv = forceValue(vm, *rfd);
-        if (rv.isBool()) recurse = (rv.asInt() == 1);
+    // Parity (review F3, 2026-07-20): the tree-walker (a) does NOT even force
+    // the attribute under --force-recurse (`!args.forceRecurse &&` guards the
+    // whole read), and (b) HARD-ERRORS via forceBool when it is present but
+    // not a Boolean.  Mirror both: skip entirely under forceRecurse; throw on
+    // a non-bool (the worker turns it into a per-job Error, exactly like TW).
+    if (!forceRecurse) {
+        static const SymbolId rfdId = ir::globalInternSymbol("recurseForDerivations");
+        // NOTE (comment corrected 2026-07-20): lookup is NOT always
+        // alloc-free (MapAttrs realisation allocates) — but `b` was
+        // re-derived from the rooted `v` above with no intervening force,
+        // and `*rfd` is read into the by-value force argument at call
+        // setup; nothing uses `b`/`rfd` after the force.
+        const Value * rfd = b->lookup(rfdId);
+        if (rfd) {
+            Value rv = forceValue(vm, *rfd);
+            if (!rv.isBool())
+                throw nix::Error(
+                    "while evaluating the `recurseForDerivations` attribute: "
+                    "value is not a Boolean");
+            recurse = (rv.asInt() == 1);
+        }
     }
     return attrs;
+}
+
+bool jobNeedsTreeWalker(EvalJobsHandle & h, bool wantConstituents)
+{
+    // Review F2+F4 (2026-07-20): three job shapes whose tree-walker semantics
+    // are NOT mirrored by the v3 accessors; the worker routes them through the
+    // original TW path (lazy TW root) for exact parity instead of silently
+    // diverging.  All three checks are non-forcing presence/tag tests on the
+    // already-WHNF rooted job slot (alloc-free — no GC hazard).
+    //
+    //  1. lambda job values: TW's per-job autoCallFunction CALLS a lambda with
+    //     all-defaulted formals (descending into its result) and hard-errors
+    //     (MissingArgumentError) on non-defaulted formals; v3 would silently
+    //     classify the closure as "not buildable" and drop it.
+    //  2. functor attrsets (`__functor`): autoCallFunction unwraps them
+    //     unconditionally (applies __functor to self, recurses on the result)
+    //     even with empty autoArgs; the v3 path would treat them as a plain
+    //     attrset and recurse into their attribute names.
+    //  3. aggregate jobs (`_hydraAggregate`) under --constituents: constituent
+    //     extraction needs coerceToString-with-context on a TW Value; emitting
+    //     the aggregate WITHOUT its constituents would silently produce empty
+    //     aggregate builds in Hydra — the worst failure mode.
+    Value v = h.jobValue;
+    if (v.tag() == Tag::Closure) return true;                      // (1)
+    if (v.isAttrs() && v.asAttrs()) {
+        static const SymbolId functorId = ir::globalInternSymbol("__functor");
+        if (v.asAttrs()->lookup(functorId)) return true;           // (2)
+        if (wantConstituents) {
+            static const SymbolId aggId = ir::globalInternSymbol("_hydraAggregate");
+            if (v.asAttrs()->lookup(aggId)) return true;           // (3)
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,10 +435,16 @@ std::vector<std::pair<std::string, std::string>> outputs(EvalJobsHandle & h)
         const Value * outsV = h.jobValue.asAttrs()->lookup(outputsId);
         if (outsV) {
             Value outs = forceValue(vm, *outsV);
+            // Review A3 (2026-07-20): register the by-value list holder so a
+            // scavenge fired inside a per-element force rewrites `outs` in
+            // place (the minor scavenger walks the GcRoot registry as of the
+            // same review), and RE-READ asList() each iteration instead of
+            // caching the ListVec* — a cached pointer would dangle the
+            // moment the list cell is forwarded.
+            V3_GC_ROOT(outs);
             if (outs.tag() == Tag::List && outs.asList()) {
-                ListVec * lv = outs.asList();
-                for (uint32_t i = 0; i < lv->size; ++i) {
-                    Value e = forceValue(vm, lv->elems[i]);
+                for (uint32_t i = 0; i < outs.asList()->size; ++i) {
+                    Value e = forceValue(vm, outs.asList()->elems[i]);
                     if (e.tag() == Tag::String && e.asString())
                         names.emplace_back(e.asString());
                 }
@@ -365,6 +482,59 @@ std::vector<std::pair<std::string, std::string>> outputs(EvalJobsHandle & h)
     return result;
 }
 
+namespace {
+
+/// Mirror of `PackageInfo::checkMeta` (libexpr get-drvs.cc): force `v`, then
+/// accept ONLY Int/Bool/String/Float scalars, lists whose every element
+/// passes, and attrsets (recursively) that do NOT carry an `outPath`
+/// attribute.  Everything else — null, paths, functions, externals, and
+/// especially DERIVATION attrsets in meta (`meta.tests = { basic = <drv>; }`,
+/// common in nixpkgs/haskell.nix; the `outPath` rejection catches them
+/// BEFORE any deep force) — is filtered out, exactly like the tree-walker.
+/// Force errors PROPAGATE (TW's checkMeta force does too → the whole job
+/// becomes a per-job eval Error).
+///
+/// GC discipline (corrected by the 2026-07-20 accessor audit): there is NO
+/// conservative C-stack pinning in v3's minor scavenge — safety comes from
+/// (a) the exitDepth gate (accessor forces run at exitDepth==1, where the
+/// scavenger currently never fires) and, robustly, (b) V3_GC_ROOT
+/// registration + the minor scavenger's GcRoot-registry walk (added in the
+/// same review), which REWRITES the registered holder in place; we then
+/// re-read `v.asList()` / `v.asAttrs()` per iteration.  Attr ids are
+/// collected first, then re-looked-up per id after each recursive force.
+bool checkMetaV3(VMState & vm, Value v)
+{
+    v = forceValue(vm, v);
+    // Register the container holder for the recursive branches below: the
+    // recursive checks force (and may scavenge — the minor scavenger walks
+    // the GcRoot registry, review 2026-07-20), and we re-read
+    // v.asList()/v.asAttrs() per iteration so a forwarded container is
+    // picked up from the rewritten slot.
+    V3_GC_ROOT(v);
+    if (v.tag() == Tag::Int || v.tag() == Tag::Bool
+        || v.tag() == Tag::String || v.tag() == Tag::Float)
+        return true;
+    if (v.tag() == Tag::List && v.asList()) {
+        for (uint32_t i = 0; i < v.asList()->size; ++i)
+            if (!checkMetaV3(vm, v.asList()->elems[i])) return false;
+        return true;
+    }
+    if (v.isAttrs() && v.asAttrs()) {
+        static const SymbolId outPathId = ir::globalInternSymbol("outPath");
+        if (v.asAttrs()->lookup(outPathId)) return false;   // drv-in-meta
+        std::vector<SymbolId> ids;
+        v.asAttrs()->forEachName([&](SymbolId id) { ids.push_back(id); });
+        for (SymbolId id : ids) {
+            const Value * p = v.asAttrs()->lookup(id);      // re-read post-force
+            if (!p || !checkMetaV3(vm, *p)) return false;
+        }
+        return true;
+    }
+    return false;   // Null / Path / Closure / PrimOp / External / …
+}
+
+} // namespace
+
 std::optional<nlohmann::json> meta(EvalJobsHandle & h)
 {
     // Mirror PackageInfo::queryMeta EXACTLY: it ALWAYS returns an (engaged)
@@ -375,6 +545,15 @@ std::optional<nlohmann::json> meta(EvalJobsHandle & h)
     // first `res[name] = …` promote it to an object, matching queryMeta's
     // `nlohmann::json meta_;` accumulation.  Returning std::nullopt here would
     // OMIT the field and diverge from TW; we never do.
+    //
+    // Review F1 (2026-07-20): every attribute is gated through checkMetaV3
+    // (TW's checkMeta filter) BEFORE serialisation.  The previous
+    // catch-and-skip around toJsonValue was NOT equivalent: it serialised
+    // null metas (TW skips them) and deep-forced + serialised derivation
+    // attrsets in meta (TW rejects them on the `outPath` probe without deep
+    // forcing).  With the filter in front, toJsonValue only ever sees
+    // checkMeta-approved shapes, which serialise without throwing — so any
+    // unexpected throw now propagates as a per-job error, exactly like TW.
     VMState & vm = *h.vm;
     Value v = h.jobValue;
     nlohmann::json res = nlohmann::json(nullptr);   // JSON null
@@ -385,8 +564,8 @@ std::optional<nlohmann::json> meta(EvalJobsHandle & h)
     if (!mV) return res;                            // no `.meta` → getMeta() null
 
     Value m = forceValue(vm, *mV);
-    // Root the meta attrset: toJsonValue below deep-forces and may relocate
-    // it, and we re-look-up each entry from `m` after each serialisation.
+    // Root the meta attrset: checkMetaV3/toJsonValue below deep-force and may
+    // relocate it, and we re-look-up each entry from `m` after each force.
     V3_GC_ROOT(m);
     if (!m.isAttrs() || !m.asAttrs()) return res;   // .meta not an attrset → null
 
@@ -397,14 +576,15 @@ std::optional<nlohmann::json> meta(EvalJobsHandle & h)
     });
 
     for (const auto & [nm, id] : metaNames) {
-        const Value * mvp = m.asAttrs()->lookup(id);   // re-read rooted `m`
-        if (!mvp) continue;
-        try {
-            res[nm] = toJsonValue(vm, *mvp, symTab);   // null → object on 1st add
-        } catch (const std::exception &) {
-            // Non-serialisable (e.g. a function) — skip, as queryMeta's
-            // checkMeta filter does.
+        {
+            const Value * mvp = m.asAttrs()->lookup(id);   // re-read rooted `m`
+            if (!mvp || !checkMetaV3(vm, *mvp)) continue;  // TW checkMeta filter
         }
+        // checkMetaV3 forced through the value; re-read from the rooted `m`
+        // (the forces may have relocated the previous lookup's referent).
+        const Value * mvp = m.asAttrs()->lookup(id);
+        if (!mvp) continue;
+        res[nm] = toJsonValue(vm, *mvp, symTab);           // null → object on 1st add
     }
     return res;
 }

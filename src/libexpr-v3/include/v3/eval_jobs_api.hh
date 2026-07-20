@@ -29,6 +29,14 @@
 /// CompilationUnit(s), a `VMState`, and the GC-rooted root + job Values.
 /// Keep it alive for the whole worker's lifetime.
 ///
+/// CONSTRAINT — at most ONE live handle per thread, destroy-before-rebuild
+/// (review A6, 2026-07-20): the handle's two GcRoot registrations live on a
+/// strictly-LIFO thread-local stack whose RAII destructor pops the TOP entry
+/// blindly.  A second concurrent handle, or constructing a replacement
+/// handle before destroying the old one, interleaves push/pop and silently
+/// unroots the other handle's slots.  nix-eval-jobs' worker satisfies this
+/// (one handle; rebuild does `reset()` first).
+///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
 
@@ -81,6 +89,22 @@ EvalJobsHandlePtr evalFlakeRoot(nix::EvalState & state,
                                 const std::string & fragment,
                                 const std::string & selectExpr);
 
+/// Root eval for the `--expr` route — THE invocation shape Hydra actually
+/// uses (hydra-eval-jobset passes `--expr 'let flake = builtins.getFlake
+/// (toString "<locked-url>"); in flake.hydraJobs or flake.checks or
+/// (throw …)'`, never `--flake`).  Runs the expression through the v3
+/// pipeline (native getFlake included) and forces the root to WHNF.
+///
+/// THROWS when the resulting root is a lambda or a functor attrset — the
+/// tree-walker's non-flake route auto-calls such roots
+/// (releaseExprTopLevelValue → autoCallFunction), which v3 does not mirror;
+/// the caller treats the throw as "v3 did not engage" and falls back to the
+/// tree-walker for exact parity.  Only call this with EMPTY autoArgs
+/// (`--arg`/`--argstr` are tree-walker-only).
+EvalJobsHandlePtr evalExprRoot(nix::EvalState & state,
+                               const std::string & exprSrc,
+                               const std::string & selectExpr);
+
 /// Descend a job attrPath from the handle's root (the `findAlongAttrPath`
 /// replacement).  Forces each intermediate segment to WHNF and stores the
 /// final value into the handle's GC-rooted "current job value" slot, which
@@ -104,9 +128,26 @@ bool isDerivation(EvalJobsHandle & h);
 /// name.  `recurse` is IN/OUT: the caller sets its default (e.g.
 /// `forceRecurse || path.empty()`); if the attrset carries a
 /// `recurseForDerivations` attribute, `recurse` is overwritten with that
-/// boolean (forced).  The caller re-applies any `forceRecurse` override
-/// after — matching the tree-walker's precedence.
-std::vector<std::string> childAttrNames(EvalJobsHandle & h, bool & recurse);
+/// boolean (forced; THROWS on a non-bool, mirroring TW's forceBool).  When
+/// `forceRecurse` is true the attribute is not read at all — the tree-walker
+/// skips even the force in that mode (`!args.forceRecurse &&` guard), so a
+/// throwing/non-bool `recurseForDerivations` must not error under
+/// --force-recurse.
+std::vector<std::string> childAttrNames(EvalJobsHandle & h, bool & recurse,
+                                        bool forceRecurse);
+
+/// True iff the current job value needs the TREE-WALKER path for exact
+/// parity (the worker then routes this one job through the original
+/// findAlongAttrPath/processDerivation with a lazily-created TW root):
+///   - lambda job values (TW's per-job autoCallFunction calls all-defaulted
+///     formals / hard-errors on missing arguments),
+///   - functor attrsets (`__functor` — autoCallFunction unwraps them),
+///   - aggregate jobs (`_hydraAggregate`) when `wantConstituents` (the
+///     constituent extraction needs coerceToString-with-context on a TW
+///     Value; emitting an aggregate with EMPTY constituents would silently
+///     produce empty aggregate builds in Hydra).
+/// All checks are non-forcing presence/tag tests (alloc-free).
+bool jobNeedsTreeWalker(EvalJobsHandle & h, bool wantConstituents);
 
 /// Force `.drvPath` of the current job value and return it as a store-path
 /// string (the `requireDrvPath` replacement — the proven byte-identical
