@@ -37,15 +37,27 @@ hydra.inputs.nix.follows = "nix";                       # already present (:28)
 
 ### 1.2 `modules/web-service-hydra.nix` — engage v3 in the evaluator
 ```nix
-# the evaluator is spawned by hydra-evaluator.service; env propagates to the
-# hydra-eval-jobset -> nix-eval-jobs worker children.
+# the evaluator is spawned by hydra-evaluator.service; env propagates through
+# execvp (hydra-evaluator.cc) and hydra-eval-jobset's %ENV copy (only NIX_PATH
+# is scrubbed — verified in the hydra source, review 2026-07-20) into the
+# nix-eval-jobs worker children.
 systemd.services.hydra-evaluator.environment = {
   NIX_V3_DIRECT_EVAL    = "1";                                  # engage the v3 VM in nix-eval-jobs
   NIX_V3_AOT_CACHE_FILE = "/var/cache/hydra/v3-aot/current.aot"; # shared CU mmap across the 20 workers
-  NIX_V3_MAX_HEAP       = "2G";                                 # typed OOM, RLIMIT_AS-safe post-B1
-  # CANARY ONLY: NIX_V3_REQUIRE = "1";  # hard-fail if v3 doesn't engage (catch silent TW fallback)
+  # DO NOT set NIX_V3_MAX_HEAP here (review F5, 2026-07-20): the evaluator's
+  # per-worker memory is governed by hydra's evaluator_max_memory_size
+  # (a soft between-jobs restart), not a hard cap.  haskell.nix-scale evals
+  # legitimately exceed 2-3 GB mid-job; a hard v3 heap cap would convert
+  # previously-succeeding evals into failures.  The 3-hour eval watchdog +
+  # the restart check are the production guards.
+  #
+  # DO NOT set NIX_V3_REQUIRE on the service (review 2026-07-20): the env is
+  # global to ALL jobsets, and REQUIRE hard-fails any worker where v3 cannot
+  # engage — including every legacy (non-flake, --arg) jobset — taking those
+  # evals down entirely.  Use NIX_V3_REQUIRE only in MANUAL shadow runs.
 };
 ```
+**How v3 engages (review-corrected):** hydra-eval-jobset invokes `nix-eval-jobs --expr 'let flake = builtins.getFlake (toString "<locked-url>"); in flake.hydraJobs or flake.checks or (throw …)' --gc-roots-dir … --meta --constituents --force-recurse --workers N --max-memory-size M` — it never passes `--flake`. The patched worker therefore engages v3 on the `--expr`+empty-autoArgs shape (`evalExprRoot`); legacy jobsets (file positional + `--arg`) stay on the tree-walker automatically. Aggregate jobs (`_hydraAggregate`, hydra always passes `--constituents`), functor attrsets, and lambda job values are routed per-job through the original tree-walker path (lazy TW root) for exact parity.
 
 ### 1.3 AOT cache builder (keyed to the jobset nixpkgs pin)
 ```nix
@@ -60,13 +72,14 @@ systemd.services.v3-aot-cache = {
 systemd.tmpfiles.rules = [ "d /var/cache/hydra/v3-aot 0755 hydra hydra - -" ];
 ```
 
-### 1.4 Retune the fleet (AFTER measuring per-worker RSS under the shared AOT on the REAL jobset)
+### 1.4 Retune the fleet — direction CORRECTED by review (2026-07-20)
 ```nix
-# modules/web-service-hydra.nix extraConfig — set FROM the measured production numbers, not guessed:
-evaluator_workers = 30;            # was 20 — more concurrent evals per box
-evaluator_max_memory_size = 768;   # was 1024 — tighter cap now that CU is shared
+# modules/web-service-hydra.nix extraConfig:
+evaluator_workers = 20;             # unchanged for v1 — retune from measured box PSS later
+evaluator_max_memory_size = 3072;   # was 1024 — RAISED for v3 (see below); NOT lowered
 ```
-**Density is PROVEN (x86_64-linux, subagent L, real patched nej):** with `--workers 3` + `NIX_V3_AOT_CACHE_FILE`, all workers map the AOT `Shared_Clean = Rss, Private_Dirty = 0` — the CU bytecode is mapped **once** (page-cache-backed) and shared read-only across the fleet, not copied. On the 8-package test jobset this saved **~25–35 MB private per worker** (66–80 MB with AOT vs 100–103 MB without); at haskell.nix/HNE scale the shareable AOT is ~126 MB (WS-5 measured 105 MB Shared_Clean), so expect **~100 MB/worker private saving** on real jobsets. The exact `workers`/`memory` retune is jobset-dependent — measure per-worker `Private_Dirty` on the production jobset under the shared AOT, then set these.
+**Why RAISED, not lowered (the earlier "768" here was wrong):** nix-eval-jobs' restart check compares **monotone `ru_maxrss`** against this limit after every job. (a) v3's per-worker RSS is structurally higher than TW's (1.6–2.5×; haskell.nix-scale jobs peak 2–3 GB), and (b) the AOT's `Shared_Clean` pages **still count toward each worker's RSS** — sharing lowers the *box's* real memory (PSS), not the per-process RSS the check reads. At 1024 every v3 worker would cross the limit on its first big job and then restart after *every* job (`ru_maxrss` never decreases), re-evaluating the root each time — an eval-throughput regression. 3072 keeps the restart a between-big-jobs hygiene event.
+**Density is PROVEN at the box level (x86_64-linux, real patched nej):** with `--workers 3` + `NIX_V3_AOT_CACHE_FILE`, all workers map the AOT `Shared_Clean = Rss, Private_Dirty = 0` — the CU bytecode is mapped **once** (page-cache-backed) and shared read-only across the fleet. On the 8-package test jobset this saved **~25–35 MB private (PSS) per worker**; at haskell.nix/HNE scale the shareable AOT is ~126 MB (WS-5 measured 105 MB Shared_Clean), so expect **~100 MB/worker real-memory saving**. Raising `evaluator_workers` beyond 20 should be driven by measured box PSS under production load, not by the per-process RSS counter.
 
 ---
 
@@ -81,8 +94,14 @@ evaluator_max_memory_size = 768;   # was 1024 — tighter cap now that CU is sha
    ```
    NOTE (getFlake requires a locked flake): v3's getFlake path hard-fails on a *dirty/unlocked* flake ref (`cannot call 'getFlake' on unlocked flake reference`). Hydra jobsets are always locked flakes, so this is satisfied in production — but any manual shadow run must use a committed-clean/locked flake.
 2. **Shadow (no production impact).** On linux-1, run patched (v3) + stock (TW) nix-eval-jobs over ONE real jobset's locked flake; **byte-compare the emitted drvPath set**. Gate: identical. (Offline nested-jobset shadow already 5/5 byte-id; this repeats it on a real jobset.)
-3. **Canary (one jobset).** Point a single low-stakes jobset's eval at v3 with `NIX_V3_DIRECT_EVAL=1` **and** `NIX_V3_REQUIRE=1` (so a silent TW fallback hard-fails and is visible). Watch: eval success, drvPath parity vs the prior TW eval, per-worker RSS, IFD-visibility log lines, no `NIX_V3_REQUIRE` failures. Hold ≥ a few eval cycles.
-4. **Full.** Remove `NIX_V3_REQUIRE`, apply the evaluator env globally, deploy the AOT builder, retune `evaluator_workers`/`evaluator_max_memory_size` from the measured RSS. `colmena apply --on linux-0`.
+3. **Canary (manual, hydra-shaped).** REVISED (review 2026-07-20): hydra's evaluator env is GLOBAL to all jobsets, so `NIX_V3_REQUIRE` cannot be scoped to one jobset on the service — a service-level REQUIRE would take down every legacy/incompatible jobset. Instead, run a MANUAL hydra-shaped invocation on linux-0/1 against a real jobset's locked URL, with REQUIRE proving engagement:
+   ```bash
+   NIX_V3_DIRECT_EVAL=1 NIX_V3_REQUIRE=1 nix-eval-jobs \
+     --expr 'let flake = builtins.getFlake (toString "<locked-url>"); in flake.hydraJobs or flake.checks or (throw "no hydraJobs")' \
+     --gc-roots-dir /tmp/canary-roots --meta --constituents --force-recurse --workers 4 --max-memory-size 3072
+   ```
+   (the EXACT argv hydra-eval-jobset uses, plus REQUIRE). Watch: engagement lines (one per worker), drvPath parity vs the same command without `NIX_V3_DIRECT_EVAL`, per-worker RSS, aggregate jobs carrying non-empty constituents (the per-job TW-fallback path), IFD-visibility lines.
+4. **Full.** Apply the evaluator env (`NIX_V3_DIRECT_EVAL`, **no REQUIRE**) via colmena; deploy the AOT builder; keep `evaluator_max_memory_size = 3072` (§1.4). Watch the first production evals' logs for the per-worker engagement lines + parity spot-checks.
 
 **Rollback at any stage:** revert §1.1 input pins (+ §1.2 env) → `nix flake lock` → `colmena apply --on linux-0`. No data migration; the evaluator process just reverts to the TW nix. Keep the prior `nix`/`nix-pkg`/`nix-eval-jobs` pins noted for a one-command revert.
 
@@ -92,7 +111,8 @@ evaluator_max_memory_size = 768;   # was 1024 — tighter cap now that CU is sha
 - **Correctness:** sample eval outputs' drvPaths match a TW re-eval (the shadow discipline, ongoing on the canary jobset). Any divergence → rollback + treat as a WS-1-class bug.
 - **Density:** per-worker `Private_Dirty` (smaps_rollup) down vs the no-AOT baseline; the AOT mapping shows `Shared_Clean = Rss, Private_Dirty = 0` on every worker (shared once). Measured on linux-1: ~25–35 MB/worker saved on the test jobset; expect ~100 MB/worker at haskell.nix scale. This is the "run more evals per box" win.
 - **IFD visibility:** the WS-2 end-of-eval IFD lines appear in the Hydra eval log; the 3-hour `hydra-eval-watchdog` can become an informed per-IFD budget.
-- **No fallbacks:** during canary, zero `NIX_V3_REQUIRE=1 … did not engage` errors.
+- **Engagement:** every production eval's log shows the per-worker `nix-eval-jobs: v3-direct engaged (--expr root via the v3 pipeline)` lines (v3 active); `v3-direct not engaged`/`falling back` lines flag jobsets that stayed on TW (legacy jobsets — expected; a flake jobset falling back is a finding). REQUIRE is manual-canary-only (§2.3).
+- **Aggregates:** aggregate jobs (`_hydraAggregate`) emit non-empty `constituents` (they route via the per-job TW fallback; an EMPTY constituents list on an aggregate is the review-F2 failure mode and grounds for rollback).
 
 ---
 

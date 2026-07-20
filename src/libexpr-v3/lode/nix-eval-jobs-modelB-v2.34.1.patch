@@ -1,54 +1,66 @@
-From e9e064b6308b015f326c2c36be7e3e0f22a109b0 Mon Sep 17 00:00:00 2001
+From b9ec13f918ad26067645d0dabbafc8651a328670 Mon Sep 17 00:00:00 2001
 From: Moritz Angermann <moritz.angermann@iohk.io>
 Date: Sat, 18 Jul 2026 16:07:42 +0700
-Subject: [PATCH] Model B: drive the v3 bytecode VM for flake jobsets (behind
- NIX_V3_DIRECT_EVAL)
+Subject: [PATCH] Model B: drive the v3 bytecode VM for hydra/flake jobsets
+ (behind NIX_V3_DIRECT_EVAL)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Wire nix-eval-jobs' worker to the v3-native accessor surface
-(nix-expr-v3 / include/v3/eval_jobs_api.hh) so v3 owns the heavy flake
-descent while ALL store-side logic stays byte-for-byte unchanged.
+(nix-expr-v3 / include/v3/eval_jobs_api.hh) so v3 owns the heavy eval
+while ALL store-side logic stays byte-for-byte unchanged.
 
-Hypothesis killed: "integrating v3 into nix-eval-jobs needs a v3->TW Value
-bridge or a rewrite of the store pipeline." Falsified -- Model B: v3 drives
-DISCOVERY + DETECTION + EXTRACTION + RECURSION natively; readDerivation /
-queryMissing / queryCacheStatus / queryInputDrvs / JSON serialization are
-untouched (they key off drvPath + store, not the value).
+Hypothesis killed (review round 2026-07-20): "gating on --flake covers
+hydra." FALSE — hydra-eval-jobset invokes `--expr 'let flake =
+builtins.getFlake (toString "<locked-url>"); in flake.hydraJobs or
+flake.checks or (throw ...)'` and NEVER --flake (source-verified against
+angerman/hydra@4c4d6fe5f). The gate now engages v3 for BOTH shapes:
+  - --flake ref[#fragment] (CLI/manual), when lockFlags carry no
+    --override-input/--update-input/--reference-lock-file (v3's internal
+    re-lock cannot honor them -> tree-walker);
+  - --expr with EMPTY autoArgs (hydra's shape) via v3::evalExprRoot;
+    lambda/functor roots throw -> tree-walker fallback
+    (autoCallFunction semantics).
+Legacy jobsets (file positional / --arg) stay on the tree-walker.
 
-Gate (mirrors the `nix` CLI):
-  - NIX_V3_DIRECT_EVAL routes flake jobsets through v3; unset falls back to
-    the tree-walker (the original path, unchanged).
-  - NIX_V3_REQUIRE hard-fails if v3 does not engage (no silent fallback).
+Exact-parity per-job tree-walker fallback (jobNeedsTreeWalker, lazy TW
+root evaluated at most once per worker):
+  - aggregate jobs (_hydraAggregate) under --constituents — hydra passes
+    --constituents ALWAYS; emitting empty constituents would create
+    silently-green empty aggregates (the worst failure mode);
+  - functor attrsets + lambda job values (TW's per-job autoCallFunction
+    calls/unwraps them; MissingArgumentError parity included).
 
-worker.cc: evaluateFlakeV3 locks the flake (TW, a fetch leaf) to get the
-locked rev-pinned ref, then hands it to v3 getFlake (load-bearing: the exact
-locked ref keeps drvPaths identical). processJobRequest / processDerivationV3
-route descend/detect/childnames/extract through the accessors; setFlakeSettings
-is wired per-worker (like main.cc). drv.cc: Drv::fromV3 builds the value-side
-fields via the accessors and runs the SAME store-side block as fromPackageInfo.
-meson: dependency('nix-expr-v3') + cpp_std=c++23 to match the v3 headers.
+Error hardening: any exception escaping the v3 section rebuilds the
+handle (reset-FIRST: the GcRoot dtor pops blindly LIFO) so the next job
+gets a clean VMState; v3::CallDepthError maps to Response::Error
+fatal=true (stack-overflow jobs abort the eval exactly like the stock
+tree-walker's nix::StackOverflowError handling).
 
-default.nix: add nixComponents.nix-expr-v3 to buildInputs so the `nix build`
-deploy route (--override-input nix <v3-nix>) supplies the component the
-meson dependency('nix-expr-v3') resolves against. The v3 nix flake exposes
-nix-expr-v3 via packaging/components.nix.
+drv.cc: Drv::fromV3 forces name -> drvPath -> outputs (same field order
+as fromPackageInfo, so errors surface from the same field); store-side
+block byte-for-byte identical. meson: dependency('nix-expr-v3') +
+cpp_std=c++23. default.nix: nixComponents.nix-expr-v3 in buildInputs
+(the `nix build --override-input nix <v3-nix>` deploy route).
 
-Known gaps (documented in-code): --constituents / --apply operate on a TW
-Value and are not wired on the v3 path; only flake jobsets use v3.
-
-Shadow parity (offline nested jobset, 5 jobs incl. recurseForDerivations gating
-+ non-derivation ignores): TW vs v3 drvPath/name/system/outputs/meta all
-byte-identical; NIX_V3_REQUIRE proves v3 engaged with no fallback.
+Gates (extended shadow jobset, 15 jobs: aggregate+constituents, functor,
+defaulted/undefaulted lambdas, drv-in-meta/null-meta/path-meta, non-bool
+recurseForDerivations, throwing job + continuation): parity OK in both
+--force-recurse and plain modes vs the pristine-TW oracle; aggregate
+carries both constituent drvPaths; worker continues after a failing job;
+--select under a 1 MB nursery (the exitDepth==0 scavenge window) green.
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
 ---
- default.nix     |   6 +++
- meson.build     |   8 ++-
- src/drv.cc      |  65 +++++++++++++++++++++++++
- src/drv.hh      |  17 +++++++
+ default.nix     |   6 ++
+ meson.build     |   8 +-
+ src/drv.cc      |  70 ++++++++++++++
+ src/drv.hh      |  17 ++++
  src/meson.build |   1 +
- src/worker.cc   | 127 ++++++++++++++++++++++++++++++++++++++++++++++--
- 6 files changed, 220 insertions(+), 4 deletions(-)
+ src/worker.cc   | 243 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 339 insertions(+), 6 deletions(-)
 
 diff --git a/default.nix b/default.nix
 index f607ca6..883fc1b 100644
@@ -94,7 +106,7 @@ index d16ab9a..b02f771 100644
  subdir('src')
  
 diff --git a/src/drv.cc b/src/drv.cc
-index 32e9467..3abc2a4 100644
+index 32e9467..71e89c7 100644
 --- a/src/drv.cc
 +++ b/src/drv.cc
 @@ -32,6 +32,8 @@
@@ -106,7 +118,7 @@ index 32e9467..3abc2a4 100644
  #include "drv.hh"
  #include "eval-args.hh"
  
-@@ -241,6 +243,69 @@ auto Drv::fromPackageInfo(std::string &attrPath, nix::EvalState &state,
+@@ -241,6 +243,74 @@ auto Drv::fromPackageInfo(std::string &attrPath, nix::EvalState &state,
      return result;
  }
  
@@ -120,16 +132,21 @@ index 32e9467..3abc2a4 100644
 +    auto store = state.store;
 +
 +    // Value-side: v3 accessors instead of PackageInfo::query{Name,DrvPath,Outputs}.
++    // Force ORDER mirrors fromPackageInfo (name -> drvPath -> outputs), so a
++    // job that errors in one of these fields errors on the SAME field as the
++    // tree-walker (review 2026-07-20).
++    auto drvName = nix::v3::name(v3h);
++    auto drvPathStr = nix::v3::drvPath(v3h);
 +    std::map<std::string, std::optional<nix::StorePath>> outputs;
 +    for (const auto &[outputName, outPathStr] : nix::v3::outputs(v3h)) {
 +        outputs[outputName] = store->parseStorePath(outPathStr);
 +    }
 +
 +    Drv result{
-+        .name = nix::v3::name(v3h),
++        .name = std::move(drvName),
 +        .storeDir = store->storeDir,
 +        .system = {},
-+        .drvPath = store->parseStorePath(nix::v3::drvPath(v3h)),
++        .drvPath = store->parseStorePath(drvPathStr),
 +        .outputs = std::move(outputs),
 +        .neededBuilds = {},
 +        .neededSubstitutes = {},
@@ -224,20 +241,29 @@ index 5b8565c..154117b 100644
  
  nix_eval_jobs_lib = static_library(
 diff --git a/src/worker.cc b/src/worker.cc
-index aa50337..5161d19 100644
+index aa50337..de4ec25 100644
 --- a/src/worker.cc
 +++ b/src/worker.cc
-@@ -45,6 +45,9 @@
+@@ -19,6 +19,7 @@
+ // NOLINTEND(modernize-deprecated-headers)
+ #include <exception>
+ #include <filesystem>
++#include <functional>
+ #include <nix/expr/attr-set.hh>
+ #include <nix/cmd/common-eval-args.hh>
+ #include <nix/util/error.hh>
+@@ -45,6 +46,10 @@
  #include <variant>
  #include <vector>
  
 +#include <v3/eval_jobs_api.hh>
++#include <v3/errors.hh> // nix::v3::CallDepthError (fatal mapping, review A4)
 +#include <v3/primop.hh> // nix::v3::setFlakeSettings (wire flakeSettings for getFlake)
 +
  #include "worker.hh"
  #include "drv.hh"
  #include "response.hh"
-@@ -99,6 +102,34 @@ auto evaluateFlake(const nix::ref<nix::EvalState> &state,
+@@ -99,6 +104,34 @@ auto evaluateFlake(const nix::ref<nix::EvalState> &state,
      return flake.toValue(*state).first;
  }
  
@@ -272,7 +298,7 @@ index aa50337..5161d19 100644
  auto attrPathJoin(nlohmann::json input) -> std::string {
      return std::accumulate(
          input.begin(), input.end(), std::string(),
-@@ -279,6 +310,39 @@ auto processDerivation(nix::EvalState &state, nix::Value *value,
+@@ -279,6 +312,43 @@ auto processDerivation(nix::EvalState &state, nix::Value *value,
      return Response::Job{std::move(drv), std::move(extraValue)};
  }
  
@@ -285,20 +311,24 @@ index aa50337..5161d19 100644
 +                         MyArgs &args) -> Response::Payload {
 +    if (!nix::v3::isDerivation(v3h)) {
 +        // Not a derivation → discover children to recurse into
-+        // (collectAttrsForRecursion's value-side logic).
++        // (collectAttrsForRecursion's value-side logic).  forceRecurse is
++        // passed THROUGH: the accessor then skips reading
++        // `recurseForDerivations` entirely (the tree-walker's
++        // `!args.forceRecurse &&` guard) and hard-errors on a non-bool
++        // otherwise — exact TW parity (review F3).
 +        bool recurse = args.forceRecurse || path.empty();
-+        auto attrs = nix::v3::childAttrNames(v3h, recurse);
-+        if (args.forceRecurse) {
-+            recurse = true; // forceRecurse wins over recurseForDerivations
-+        }
++        auto attrs = nix::v3::childAttrNames(v3h, recurse, args.forceRecurse);
 +        return Response::Attrs{recurse ? std::move(attrs)
 +                                       : std::vector<std::string>{}};
 +    }
 +
-+    // NOTE (known gap): --constituents and --apply operate on a tree-walker
-+    // nix::Value (coerceToString / callFunction) and are not wired on the v3
-+    // path yet; a v3 job carries no constituents / extraValue.  Core discovery,
-+    // detection, and extraction are fully v3-native.
++    // NOTE: aggregate jobs (`_hydraAggregate`) under --constituents never
++    // reach this function — processJobRequest routes them through the
++    // original tree-walker path (jobNeedsTreeWalker, review F2), because
++    // constituent extraction needs coerceToString-with-context on a TW
++    // Value.  --apply is likewise TW-only (hydra does not use it); a v3 job
++    // carries no extraValue.  Core discovery, detection, and extraction are
++    // fully v3-native.
 +    Constituents constituents{};
 +    std::optional<nlohmann::json> extraValue;
 +
@@ -312,39 +342,83 @@ index aa50337..5161d19 100644
  auto initializeRootValue(const nix::ref<nix::EvalState> &state,
                           nix::Bindings &autoArgs, MyArgs &args)
      -> nix::Value * {
-@@ -318,7 +382,8 @@ auto shouldRestart(const MyArgs &args) -> bool {
+@@ -318,7 +388,10 @@ auto shouldRestart(const MyArgs &args) -> bool {
  
  auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
                         nix::AutoCloseFD &toParent, nix::Bindings &autoArgs,
 -                       nix::Value *vRoot, MyArgs &args) -> bool {
-+                       nix::Value *vRoot, nix::v3::EvalJobsHandle *v3h,
-+                       MyArgs &args) -> bool {
++                       const std::function<nix::Value *()> &ensureTwRoot,
++                       nix::v3::EvalJobsHandlePtr &v3Handle,
++                       const std::function<void()> &rebuildV3, MyArgs &args)
++    -> bool {
      /* Wait for the collector to send us a job name. */
      if (tryWriteLine(toParent.get(), "next") < 0) {
          return false; // main process died
-@@ -341,6 +406,21 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
+@@ -341,8 +414,44 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
      /* Evaluate it and send info back to the collector. */
      Response::Payload payload = [&]() -> Response::Payload {
          try {
 +            // Model B: when a v3 handle is present (NIX_V3_DIRECT_EVAL),
-+            // v3 owns the descent/detection/extraction.  (autoCallFunction
-+            // is a no-op here: flake autoArgs is empty and jobs are attrsets,
-+            // not defaulted-arg functions — see the known-gap note.)
-+            if (v3h != nullptr) {
-+                nix::v3::descendAttrPath(*v3h,
-+                                         path.get<std::vector<std::string>>());
-+                if (nix::v3::isAttrs(*v3h)) {
-+                    return processDerivationV3(state, *v3h, attrPathS, path,
-+                                               args);
++            // v3 owns the descent/detection/extraction — EXCEPT for the
++            // three job shapes jobNeedsTreeWalker flags (aggregate jobs
++            // under --constituents, functor attrsets, lambda values); those
++            // fall through to the ORIGINAL tree-walker block below for
++            // exact parity (review F2+F4), against a lazily-created TW root.
++            //
++            // Error hardening (review, 2026-07-20): any exception escaping
++            // the v3 section (an eval error in a job is NORMAL in Hydra
++            // jobsets) unwinds mid-dispatch and may leave the handle's
++            // VMState frames/stacks in an indeterminate state.  Rather than
++            // reason about unwind-safety of the VM internals, we REBUILD the
++            // handle (cheap: root re-force is warm via the disk/applied
++            // caches) and rethrow so the outer catch still emits the same
++            // per-job Error response the tree-walker would.
++            if (v3Handle) {
++                try {
++                    nix::v3::descendAttrPath(
++                        *v3Handle, path.get<std::vector<std::string>>());
++                    if (!nix::v3::jobNeedsTreeWalker(*v3Handle,
++                                                     args.constituents)) {
++                        if (nix::v3::isAttrs(*v3Handle)) {
++                            return processDerivationV3(state, *v3Handle,
++                                                       attrPathS, path, args);
++                        }
++                        // We ignore everything that cannot be built
++                        return Response::Attrs{{}};
++                    }
++                    // else: parity fallback → tree-walker path below.
++                } catch (...) {
++                    rebuildV3(); // fresh VMState for the NEXT job
++                    throw;       // outer catch → per-job Error response
 +                }
-+                // We ignore everything that cannot be built
-+                return Response::Attrs{{}};
 +            }
 +
              auto *vTmp =
-                 nix::findAlongAttrPath(state, attrPathS, autoArgs, *vRoot)
+-                nix::findAlongAttrPath(state, attrPathS, autoArgs, *vRoot)
++                nix::findAlongAttrPath(state, attrPathS, autoArgs,
++                                       *ensureTwRoot())
                      .first;
-@@ -406,12 +486,53 @@ void worker(
+ 
+             auto *value = state.allocValue();
+@@ -362,6 +471,17 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
+             // Print to STDERR for Hydra UI
+             std::cerr << msg << "\n";
+             return Response::Error{nix::filterANSIEscapes(msg, true)};
++        } catch (const nix::v3::CallDepthError &e) {
++            // Review A4 (2026-07-20): v3's kMaxCallDepth guard is the
++            // analogue of the tree-walker's nix::StackOverflowError — mark
++            // it FATAL so the collector aborts the eval exactly like the
++            // stock tree-walker path does for infinite recursion.
++            const auto *msg = e.what();
++            std::cerr << msg << '\n';
++            return Response::Error{
++                .error = nix::filterANSIEscapes(msg, true),
++                .fatal = true,
++            };
+         } catch (const std::exception &e) {
+             // FIXME: for some reason the catch block above doesn't trigger on
+             // macOS (?)
+@@ -406,12 +526,125 @@ void worker(
          args.lookupPath, evalStore, nix::fetchSettings, nix::evalSettings);
      nix::Bindings &autoArgs = *args.getAutoArgs(*state);
  
@@ -360,17 +434,54 @@ index aa50337..5161d19 100644
 +    nix::v3::EvalJobsHandlePtr v3Handle; // null unless v3 engages
 +    nix::Value *vRoot = nullptr;
 +
-+    if (v3Direct && args.flake) {
++    // Review F6 (2026-07-20): v3's native getFlake re-locks the (rev-pinned)
++    // flakeref internally with DEFAULT lock flags — it cannot honor
++    // --override-input / --update-input / --no-write-lock-file-style
++    // overrides or an external --reference-lock-file, so engaging v3 with
++    // any of those set would silently evaluate the UN-overridden lock.
++    // Hydra passes none of them; fall back to the tree-walker when present.
++    const bool lockFlagsV3Compatible =
++        args.lockFlags.inputOverrides.empty() &&
++        args.lockFlags.inputUpdates.empty() &&
++        !args.lockFlags.recreateLockFile &&
++        !args.lockFlags.referenceLockFilePath.has_value();
++
++    if (v3Direct && args.flake && !lockFlagsV3Compatible) {
++        std::cerr << "nix-eval-jobs: v3-direct not engaged (lock-file "
++                     "overrides --override-input/--update-input/"
++                     "--reference-lock-file are tree-walker-only)\n";
++    }
++
++    // TWO v3-eligible invocation shapes (review 2026-07-20):
++    //   (a) --flake ref[#fragment]           — the CLI/manual shape;
++    //   (b) --expr '<expr>' with EMPTY autoArgs — THE shape Hydra actually
++    //       uses (hydra-eval-jobset synthesizes `let flake =
++    //       builtins.getFlake (toString "<locked-url>"); in flake.hydraJobs
++    //       or flake.checks or (throw …)` and passes it via --expr; it
++    //       never passes --flake).  Gating only on args.flake made the
++    //       production deploy a silent no-op.
++    // Legacy jobsets (a FILE positional and/or --arg/--argstr) never engage:
++    // fromArgs is false and/or autoArgs is non-empty.
++    const bool v3ExprShape = args.fromArgs && autoArgs.size() == 0;
++
++    if (v3Direct && ((args.flake && lockFlagsV3Compatible) || v3ExprShape)) {
 +        // Wire libcmd's flakeSettings global into v3's thread-local pointer so
 +        // the native builtins.getFlake can lock/read the flake (mirrors the
 +        // `nix` CLI's main.cc startup wiring; the worker runs in its own
 +        // forked process/thread, so this thread_local set is per-worker).
 +        nix::v3::setFlakeSettings(&nix::flakeSettings);
 +        try {
-+            v3Handle = evaluateFlakeV3(state, args.releaseExpr, args.lockFlags,
-+                                       args.selectExpr);
-+            std::cerr << "nix-eval-jobs: v3-direct engaged (flake root via "
-+                         "builtins.getFlake)\n";
++            if (args.flake) {
++                v3Handle = evaluateFlakeV3(state, args.releaseExpr,
++                                           args.lockFlags, args.selectExpr);
++                std::cerr << "nix-eval-jobs: v3-direct engaged (flake root "
++                             "via builtins.getFlake)\n";
++            } else {
++                v3Handle = nix::v3::evalExprRoot(*state, args.releaseExpr,
++                                                 args.selectExpr);
++                std::cerr << "nix-eval-jobs: v3-direct engaged (--expr root "
++                             "via the v3 pipeline)\n";
++            }
 +        } catch (const std::exception &e) {
 +            if (v3Require) {
 +                throw; // no silent fallback under NIX_V3_REQUIRE
@@ -384,19 +495,55 @@ index aa50337..5161d19 100644
 +
 +    if (v3Require && !v3Handle) {
 +        throw nix::Error(
-+            "NIX_V3_REQUIRE=1 but v3-direct did not engage (only flake "
-+            "jobsets are supported on the v3 path)");
++            "NIX_V3_REQUIRE=1 but v3-direct did not engage (supported: "
++            "--flake without lock-file overrides, or --expr without "
++            "--arg/--argstr)");
 +    }
 +
 +    if (!v3Handle) {
 +        vRoot = initializeRootValue(state, autoArgs, args);
 +    }
++
++    // Lazy tree-walker root for the v3 mode's parity-fallback jobs
++    // (aggregate/functor/lambda — jobNeedsTreeWalker).  Evaluated at most
++    // once per worker, and only if such a job actually occurs.
++    auto ensureTwRoot = [&]() -> nix::Value * {
++        if (vRoot == nullptr) {
++            std::cerr << "nix-eval-jobs: initializing tree-walker root for a "
++                         "parity-fallback job (aggregate/functor/lambda)\n";
++            vRoot = initializeRootValue(state, autoArgs, args);
++        }
++        return vRoot;
++    };
++
++    // Rebuild the v3 handle after a per-job v3 exception (see
++    // processJobRequest).  Order is load-bearing: reset() FIRST — the
++    // handle's two GcRoot registrations are popped LIFO while they are the
++    // stack's top entries (GcRoot::~GcRoot pops blindly); constructing the
++    // replacement first would interleave push/pop and corrupt the root
++    // stack.  If the rebuild itself fails, remaining jobs on this worker
++    // use the tree-walker root (exactly the engagement-failure fallback).
++    auto rebuildV3 = [&]() noexcept {
++        try {
++            v3Handle.reset();
++            v3Handle = args.flake
++                           ? evaluateFlakeV3(state, args.releaseExpr,
++                                             args.lockFlags, args.selectExpr)
++                           : nix::v3::evalExprRoot(*state, args.releaseExpr,
++                                                   args.selectExpr);
++        } catch (...) {
++            v3Handle.reset();
++            std::cerr << "nix-eval-jobs: v3 handle rebuild failed; remaining "
++                         "jobs on this worker use the tree-walker\n";
++        }
++    };
  
      LineReader fromReader(fromParent.release());
  
-     while (processJobRequest(*state, fromReader, toParent, autoArgs, vRoot,
+-    while (processJobRequest(*state, fromReader, toParent, autoArgs, vRoot,
 -                             args)) {
-+                             v3Handle.get(), args)) {
++    while (processJobRequest(*state, fromReader, toParent, autoArgs,
++                             ensureTwRoot, v3Handle, rebuildV3, args)) {
          // Continue processing jobs until we need to exit
      }
  
