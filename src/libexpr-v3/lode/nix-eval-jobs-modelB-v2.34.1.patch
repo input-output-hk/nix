@@ -1,4 +1,4 @@
-From b9ec13f918ad26067645d0dabbafc8651a328670 Mon Sep 17 00:00:00 2001
+From 0b8731b5d64fc8d3dd1521b994e2a4b36d08ed55 Mon Sep 17 00:00:00 2001
 From: Moritz Angermann <moritz.angermann@iohk.io>
 Date: Sat, 18 Jul 2026 16:07:42 +0700
 Subject: [PATCH] Model B: drive the v3 bytecode VM for hydra/flake jobsets
@@ -7,60 +7,37 @@ MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-Wire nix-eval-jobs' worker to the v3-native accessor surface
-(nix-expr-v3 / include/v3/eval_jobs_api.hh) so v3 owns the heavy eval
-while ALL store-side logic stays byte-for-byte unchanged.
+Wire nix-eval-jobs' worker to the v3-native accessor surface (nix-expr-v3)
+so v3 owns the heavy eval while all store-side logic stays byte-identical.
 
-Hypothesis killed (review round 2026-07-20): "gating on --flake covers
-hydra." FALSE — hydra-eval-jobset invokes `--expr 'let flake =
-builtins.getFlake (toString "<locked-url>"); in flake.hydraJobs or
-flake.checks or (throw ...)'` and NEVER --flake (source-verified against
-angerman/hydra@4c4d6fe5f). The gate now engages v3 for BOTH shapes:
-  - --flake ref[#fragment] (CLI/manual), when lockFlags carry no
-    --override-input/--update-input/--reference-lock-file (v3's internal
-    re-lock cannot honor them -> tree-walker);
-  - --expr with EMPTY autoArgs (hydra's shape) via v3::evalExprRoot;
-    lambda/functor roots throw -> tree-walker fallback
-    (autoCallFunction semantics).
-Legacy jobsets (file positional / --arg) stay on the tree-walker.
+Gate: NIX_V3_DIRECT_EVAL engages v3 for hydra's --expr getFlake shape (and
+--flake without lock overrides); legacy jobsets and --apply stay on TW.
+Per-job TW routing (jobNeedsTreeWalker): aggregate/functor/lambda jobs.
 
-Exact-parity per-job tree-walker fallback (jobNeedsTreeWalker, lazy TW
-root evaluated at most once per worker):
-  - aggregate jobs (_hydraAggregate) under --constituents — hydra passes
-    --constituents ALWAYS; emitting empty constituents would create
-    silently-green empty aggregates (the worst failure mode);
-  - functor attrsets + lambda job values (TW's per-job autoCallFunction
-    calls/unwraps them; MissingArgumentError parity included).
+TW-RETRY SAFETY NET (round-2 review CR7-R1/CR8-R1): v3 is the fast path,
+the tree-walker is the correctness oracle.  On ANY per-job v3 exception the
+worker rebuilds the handle and RETRIES that job on the tree-walker (unless
+NIX_V3_REQUIRE), so a v3-vs-TW divergence can never make hydra wrong or
+worse-formatted — worst case a divergent job is evaluated twice.  This
+subsumes the numeric-segment / CA-output / non-attrset-meta / output-shape
+/ error-byte divergence classes.
 
-Error hardening: any exception escaping the v3 section rebuilds the
-handle (reset-FIRST: the GcRoot dtor pops blindly LIFO) so the next job
-gets a clean VMState; v3::CallDepthError maps to Response::Error
-fatal=true (stack-overflow jobs abort the eval exactly like the stock
-tree-walker's nix::StackOverflowError handling).
+Also: CallDepthError -> fatal Response::Error (TW StackOverflowError
+parity); engagement requires empty applyExpr (CR6-D4); v3Require read once.
 
-drv.cc: Drv::fromV3 forces name -> drvPath -> outputs (same field order
-as fromPackageInfo, so errors surface from the same field); store-side
-block byte-for-byte identical. meson: dependency('nix-expr-v3') +
-cpp_std=c++23. default.nix: nixComponents.nix-expr-v3 in buildInputs
-(the `nix build --override-input nix <v3-nix>` deploy route).
-
-Gates (extended shadow jobset, 15 jobs: aggregate+constituents, functor,
-defaulted/undefaulted lambdas, drv-in-meta/null-meta/path-meta, non-bool
-recurseForDerivations, throwing job + continuation): parity OK in both
---force-recurse and plain modes vs the pristine-TW oracle; aggregate
-carries both constituent drvPaths; worker continues after a failing job;
---select under a 1 MB nursery (the exitDepth==0 scavenge window) green.
+git-am-clean on pristine v2.34.1 (65ebf5b).  Gates: shadow parity 10 jobs
+v3==TW (3 retries all -> correct), full --brute 41/41 on the v3 nix.
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
 ---
  default.nix     |   6 ++
  meson.build     |   8 +-
- src/drv.cc      |  70 ++++++++++++++
- src/drv.hh      |  17 ++++
+ src/drv.cc      |  70 +++++++++++++
+ src/drv.hh      |  17 +++
  src/meson.build |   1 +
- src/worker.cc   | 243 +++++++++++++++++++++++++++++++++++++++++++++++-
- 6 files changed, 339 insertions(+), 6 deletions(-)
+ src/worker.cc   | 274 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 370 insertions(+), 6 deletions(-)
 
 diff --git a/default.nix b/default.nix
 index f607ca6..883fc1b 100644
@@ -241,7 +218,7 @@ index 5b8565c..154117b 100644
  
  nix_eval_jobs_lib = static_library(
 diff --git a/src/worker.cc b/src/worker.cc
-index aa50337..de4ec25 100644
+index aa50337..3008436 100644
 --- a/src/worker.cc
 +++ b/src/worker.cc
 @@ -19,6 +19,7 @@
@@ -342,7 +319,7 @@ index aa50337..de4ec25 100644
  auto initializeRootValue(const nix::ref<nix::EvalState> &state,
                           nix::Bindings &autoArgs, MyArgs &args)
      -> nix::Value * {
-@@ -318,7 +388,10 @@ auto shouldRestart(const MyArgs &args) -> bool {
+@@ -318,7 +388,15 @@ auto shouldRestart(const MyArgs &args) -> bool {
  
  auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
                         nix::AutoCloseFD &toParent, nix::Bindings &autoArgs,
@@ -351,10 +328,15 @@ index aa50337..de4ec25 100644
 +                       nix::v3::EvalJobsHandlePtr &v3Handle,
 +                       const std::function<void()> &rebuildV3, MyArgs &args)
 +    -> bool {
++    // NIX_V3_REQUIRE (read once): when set, the v3 path must not silently
++    // fall back to the tree-walker — used by CI shadow runs to prove v3
++    // engaged.  In production it is unset, so the TW-retry net below is armed.
++    static const bool v3Require = std::getenv("NIX_V3_REQUIRE") != nullptr;
++
      /* Wait for the collector to send us a job name. */
      if (tryWriteLine(toParent.get(), "next") < 0) {
          return false; // main process died
-@@ -341,8 +414,44 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
+@@ -341,8 +419,61 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
      /* Evaluate it and send info back to the collector. */
      Response::Payload payload = [&]() -> Response::Payload {
          try {
@@ -365,14 +347,26 @@ index aa50337..de4ec25 100644
 +            // fall through to the ORIGINAL tree-walker block below for
 +            // exact parity (review F2+F4), against a lazily-created TW root.
 +            //
-+            // Error hardening (review, 2026-07-20): any exception escaping
-+            // the v3 section (an eval error in a job is NORMAL in Hydra
-+            // jobsets) unwinds mid-dispatch and may leave the handle's
-+            // VMState frames/stacks in an indeterminate state.  Rather than
-+            // reason about unwind-safety of the VM internals, we REBUILD the
-+            // handle (cheap: root re-force is warm via the disk/applied
-+            // caches) and rethrow so the outer catch still emits the same
-+            // per-job Error response the tree-walker would.
++            // TW-RETRY SAFETY NET (review CR7-R1 / CR8-R1, 2026-07-22): v3 is
++            // the FAST PATH; the tree-walker is the correctness ORACLE.  On
++            // ANY exception from the v3 section — an eval error in a job is
++            // NORMAL in Hydra jobsets, but it can also be a v3-vs-TW semantic
++            // DIVERGENCE (a shape v3 rejects that TW accepts, or vice versa) —
++            // we rebuild the v3 handle (fresh VMState for subsequent jobs) and
++            // RETRY THIS JOB on the tree-walker instead of emitting v3's error
++            // directly.  Consequences:
++            //   * a genuine eval error: TW re-hits it and emits the error with
++            //     TW's exact position/trace formatting (byte-parity — fixes
++            //     the "v3 error bytes differ" divergence);
++            //   * a v3-vs-TW divergence where TW succeeds: hydra gets the
++            //     CORRECT TW result instead of a spurious per-job error / a
++            //     dropped build (fixes the whole divergence class: numeric
++            //     attr segments, CA outputs, non-attrset meta, output-shape
++            //     laxness, …).
++            // So a residual v3 divergence can never make hydra wrong or worse
++            // — worst case the divergent job is evaluated twice (slower).
++            // Under NIX_V3_REQUIRE we do NOT fall back (the mode exists to
++            // PROVE v3 engaged, for CI shadow runs), so we rethrow there.
 +            if (v3Handle) {
 +                try {
 +                    nix::v3::descendAttrPath(
@@ -387,9 +381,14 @@ index aa50337..de4ec25 100644
 +                        return Response::Attrs{{}};
 +                    }
 +                    // else: parity fallback → tree-walker path below.
-+                } catch (...) {
++                } catch (const std::exception & e) {
 +                    rebuildV3(); // fresh VMState for the NEXT job
-+                    throw;       // outer catch → per-job Error response
++                    if (v3Require)
++                        throw;   // no silent fallback under NIX_V3_REQUIRE
++                    std::cerr << "nix-eval-jobs: v3 job '" << attrPathS
++                              << "' errored, retrying on the tree-walker: "
++                              << e.what() << '\n';
++                    // fall through to the tree-walker path below (retry).
 +                }
 +            }
 +
@@ -400,7 +399,7 @@ index aa50337..de4ec25 100644
                      .first;
  
              auto *value = state.allocValue();
-@@ -362,6 +471,17 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
+@@ -362,6 +493,17 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
              // Print to STDERR for Hydra UI
              std::cerr << msg << "\n";
              return Response::Error{nix::filterANSIEscapes(msg, true)};
@@ -418,7 +417,7 @@ index aa50337..de4ec25 100644
          } catch (const std::exception &e) {
              // FIXME: for some reason the catch block above doesn't trigger on
              // macOS (?)
-@@ -406,12 +526,125 @@ void worker(
+@@ -406,12 +548,134 @@ void worker(
          args.lookupPath, evalStore, nix::fetchSettings, nix::evalSettings);
      nix::Bindings &autoArgs = *args.getAutoArgs(*state);
  
@@ -464,7 +463,16 @@ index aa50337..de4ec25 100644
 +    // fromArgs is false and/or autoArgs is non-empty.
 +    const bool v3ExprShape = args.fromArgs && autoArgs.size() == 0;
 +
-+    if (v3Direct && ((args.flake && lockFlagsV3Compatible) || v3ExprShape)) {
++    // Review CR6-D4 (2026-07-22): --apply transforms each job value via a
++    // tree-walker callFunction and emits the result as `extraValue`
++    // (response.cc).  The v3 processDerivationV3 path carries no extraValue,
++    // so engaging v3 under --apply would silently DROP it.  Hydra does not
++    // pass --apply, but the engagement gate must enforce that rather than
++    // rely on it — require an empty applyExpr for v3 to engage.
++    const bool v3ApplyOk = args.applyExpr.empty();
++
++    if (v3Direct && v3ApplyOk
++        && ((args.flake && lockFlagsV3Compatible) || v3ExprShape)) {
 +        // Wire libcmd's flakeSettings global into v3's thread-local pointer so
 +        // the native builtins.getFlake can lock/read the flake (mirrors the
 +        // `nix` CLI's main.cc startup wiring; the worker runs in its own
