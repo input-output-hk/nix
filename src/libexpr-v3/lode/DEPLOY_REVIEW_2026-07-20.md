@@ -48,3 +48,76 @@ Accessor by-value force discipline + string copies (nothing returns arena-backed
 ## Deferred (documented, not blocking)
 
 CA-derivation `queryOutputs(false)` fallback (zw3rk has no CA drvs); tier-1 `showErrorInfo` formatting for v3 error messages (per-job errors carry the v3 message without TW trace formatting — cosmetic); fragment prefix-fallback (`packages.<sys>.<frag>`) — engagement-failure falls back to TW which reproduces TW behavior exactly; scavenge-at-accessor-depth (future; unblocked by G1).
+
+---
+
+# Round-2 clean-room review (2026-07-22)
+
+Ten reviewers re-run with EMPTY context (no lode docs, no prior findings — so
+they couldn't be primed by round-1's conclusions), each an independent lens.
+They found real bugs — several IN THE 2026-07-20 FIXES THEMSELVES. All fixed
++ re-gated; branches re-pushed fast-forward (nix @5ce4305fb, nej fork
+2.34.1-v3 @83ef1e2, portable patch regenerated + git-am-verified, tree
+identical to the branch).
+
+## Confirmed + fixed
+
+- **CR7-C1 (the sharpest; a self-inflicted regression):** v3 `kMaxCallDepth`
+  was 5000, but the tree-walker's `max-call-depth` DEFAULTS to 10000. So jobs
+  recursing 5001..10000 frames (deep haskell.nix module fixpoints) threw where
+  stock nix succeeds — and the round-1 A4 change (CallDepthError→fatal) made
+  that a WHOLE-EVAL abort. Raised to 10000; ceilings now coincide. Verified: a
+  7000-deep job builds instead of aborting.
+- **CR5-#1:** A4 converted only 2 of 6 call-depth guard sites. Did the other
+  four (OP_CALL_N, OP_FORCE, forceValue, callClosureNExact).
+- **CR5-#2:** `addErrorContext` erased CallDepthError to runtime_error on the
+  common nixpkgs unwind path. Added the type-preserving arm.
+- **CR6-D1 (silent wrong derivation):** an intermediate `__functor` attrset was
+  looked up raw instead of autoCall-unwrapped → a shadowing child could be
+  emitted as the WRONG drv. descendAttrPath now detects it and throws → TW
+  retry. Verified: interFunctor.group.real = "correct", SHADOW-WRONG count 0.
+- **CR6-D6/D8/D10:** non-attrset `.meta` throws (TW parity); checkMetaV3 depth
+  guard (deep meta → clean error, no C-stack-overflow worker crash); UTF-8 meta
+  force-dumped in-path (no out-of-try worker crash).
+- **CR8-C1:** AOT `off+len` u64-overflow bounds checks → `off>size||len>size-off`
+  (latent; AOT disabled by default).
+- **CR5-#3:** `GcRoot::~GcRoot` erases its OWN entry (heap-held/out-of-order
+  handle destruction is safe now that the minor scavenger walks the registry).
+- **CR5-#4:** postScavengeAudit mirrors the registry walk (brute audit now
+  covers that root class).
+
+## Architectural safety net (CR7-R1 / CR8-R1) — the highest-value change
+
+The nej worker now treats **v3 as the fast path and the tree-walker as the
+correctness ORACLE**: on ANY per-job v3 exception it rebuilds the handle and
+RETRIES that job on the tree-walker (unless NIX_V3_REQUIRE). So a residual
+v3-vs-TW divergence can never make hydra wrong or worse-formatted — worst case
+a divergent job is evaluated twice. This subsumes the whole class of
+throwing divergences (numeric attr segments, CA outputs, non-attrset meta,
+output-shape laxness, error-byte formatting). D1's silent-wrong-data case is
+handled separately by the intermediate-functor detection above.
+
+## Verified CLEAN by the clean-room reviewers (no change needed)
+
+Injection (escapeNixString complete for the Nix string grammar); cross-jobset
+cache poisoning (CU/EvalResult keys are content-addressed); SQLite under 20-way
+concurrency (WAL + 1h busy-timeout, degrades to cache-miss); cross-DSO
+CallDepthError typeinfo (default visibility → catch-by-type works across the
+libnixexprv3 .so into nej); backport fidelity (subsystem ported byte-identical;
+independently re-confirmed the G1 walk is correct — "2.34 has strictly more
+root coverage, not less"); gate-off parity (libexpr/libstore/libmain
+byte-identical to base d9ffe24ea; v3-lib static-init inventory clean; no new
+stderr output gate-off).
+
+## Latent / deferred (documented, not deploy-blocking in the production config)
+
+- AOT C2 (no key↔blob integrity → tampered AOT = silently-wrong eval): AOT is
+  disabled by default (v3AotWorkloads=[]); gate enabling it on a per-blob hash
+  + moving the AOT build out of the eval user's write scope.
+- NIX_TRACE_EVAL file-truncate + V3_DBG_SIGTRAP load-time read: env is clean in
+  the hydra-evaluator unit; hardening candidates.
+- system-nix `.#nix` doCheck: GitTest/DirectoryIterator unit tests fail in the
+  linux-1 build sandbox — A/B-PROVEN identical on the deployed base d9ffe24ea
+  (v3-independent, environmental). The deploy-critical hydra closure builds
+  green regardless (it builds the nix-* components, not the doCheck'd
+  everything-package).
