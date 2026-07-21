@@ -241,7 +241,11 @@ bool tryInitLocked()
             if (loadU32(e + 32) != static_cast<uint32_t>(TBL_CU)) continue;
             uint64_t off = loadU64(e + 40);
             uint64_t len = loadU64(e + 48);
-            if (off + len > fileSize) continue;
+            // Review CR8-C1 (2026-07-22): overflow-safe bounds check — `off`
+            // and `len` are u64 read verbatim from the file, so `off + len`
+            // can wrap and pass a naive `>` test, yielding an out-of-range
+            // string_view (OOB read / crash).  Test without adding.
+            if (off > fileSize || len > fileSize - off) continue;
             if (!serialize::readSparseTables(
                     std::string_view(reinterpret_cast<const char *>(base + off),
                                      static_cast<size_t>(len)),
@@ -368,7 +372,8 @@ lookup(const disk_cache::CacheKey & key, TableId table) noexcept
             const uint8_t * e2 = r.entries + mid * kEntrySize;
             uint64_t off = loadU64(e2 + 40);
             uint64_t len = loadU64(e2 + 48);
-            if (off + len > r.mapBytes) {
+            // Review CR8-C1 (2026-07-22): overflow-safe (see the init path).
+            if (off > r.mapBytes || len > r.mapBytes - off) {
                 ++st.errors;
                 return std::nullopt;
             }

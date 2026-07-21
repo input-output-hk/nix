@@ -45,11 +45,13 @@ void walkCppStackRoots(RootVisitor & visitor) noexcept
 }
 
 GcRoot::GcRoot(Value & v) noexcept
+    : registered_(&v)
 {
     gcRootStack().push_back(&v);
 }
 
 GcRoot::GcRoot(Value * p) noexcept
+    : registered_(p)
 {
     gcRootStack().push_back(p);
 }
@@ -83,14 +85,25 @@ GcRootVec::~GcRootVec() noexcept
 
 GcRoot::~GcRoot() noexcept
 {
-    // LIFO discipline: we always pop the top.  Mismatched ordering
-    // (e.g., two GcRoot objects destructed out-of-order via
-    // exception unwinding from inside the registered scope) is
-    // impossible because we deleted move + copy and require the
-    // RAII to be stack-allocated.  Defensive: nothing fires if the
-    // stack is somehow empty.
+    // Pop OUR OWN entry (review CR5-#3, 2026-07-22).  The common case — a
+    // single stack-scoped GcRoot, or a handle's root/job guards destructed in
+    // reverse construction order — is the stack top, an O(1) pop.  The
+    // safety-critical case is out-of-order / heap-held destruction (two live
+    // EvalJobsHandles, or replace-before-destroy): blindly popping the top
+    // there would drop SOMEONE ELSE's live slot and leave ours dangling for
+    // the minor scavenger's registry walk to dereference.  Find-and-erase our
+    // own `registered_` handles every ordering.  The registry is tiny (a
+    // handful of long-lived + a few scoped temporaries), so the rare
+    // not-on-top search is negligible.
     auto & s = gcRootStack();
-    if (!s.empty()) s.pop_back();
+    if (s.empty()) return;
+    if (s.back() == registered_) { s.pop_back(); return; }
+    for (auto it = s.end(); it != s.begin(); ) {
+        --it;
+        if (*it == registered_) { s.erase(it); return; }
+    }
+    // Not found: our entry was already removed (double-pop upstream) — nothing
+    // to do; never blindly pop a stranger's slot.
 }
 
 } // namespace nix::v3

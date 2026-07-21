@@ -1610,6 +1610,18 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
             a.visitList(*slot, "capWithsCache");
     }
 
+    // 6e. C++-stack GcRoot registry (review CR5-#4, 2026-07-22).  The minor
+    //    scavenger walks gcRootStack()/gcRootVecStack() (review G1); the audit
+    //    MUST mirror every root the scavenger walks or a "clean" verdict is a
+    //    false statement about this root class.  Without this the brute audit
+    //    was structurally blind to exactly the class the G1 fix protects.
+    a.root = "gcRootRegistry";
+    for (Value * p : gcRootStack())
+        if (p) a.visitValue(*p, "gcRootRegistry");
+    for (std::vector<Value> * vec : gcRootVecStack())
+        if (vec)
+            for (Value & v : *vec) a.visitValue(v, "gcRootRegistry.vec");
+
     // 7. AttrSelectIC entries via reached Closures / Thunks.
     //    Already handled implicitly: visitClosure / visitThunk above
     //    queue the IC entries' Bindings via the walkedCUs/visited

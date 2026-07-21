@@ -4457,6 +4457,17 @@ void primAddErrorContext(EvalState & state, Value * args, Value & out)
         auto msg = coerceMsg();
         if (dbg) std::fprintf(stderr, "v3 addErrorContext (BlackholeError): %s\n", msg.c_str());
         throw BlackholeError(std::string(ex.what()) + "\n… " + msg);
+    } catch (const CallDepthError & ex) {
+        // Review CR5-#2 (2026-07-22): preserve the depth-guard type across an
+        // addErrorContext unwind (ubiquitous in nixpkgs lib/modules.nix).
+        // Without this arm CallDepthError fell into the std::exception arm
+        // below and was re-thrown as a bare runtime_error, so nix-eval-jobs
+        // lost the FATAL classification (TW's StackOverflowError analogue) on
+        // the most common unwind path — silently defeating the whole point of
+        // the distinct type.
+        auto msg = coerceMsg();
+        if (dbg) std::fprintf(stderr, "v3 addErrorContext (CallDepthError): %s\n", msg.c_str());
+        throw CallDepthError(std::string(ex.what()) + "\n… " + msg);
     } catch (const std::exception & ex) {
         auto msg = coerceMsg();
         if (dbg) std::fprintf(stderr, "v3 addErrorContext: %s\n", msg.c_str());

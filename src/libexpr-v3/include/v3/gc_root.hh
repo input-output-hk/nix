@@ -119,6 +119,16 @@ public:
     GcRoot & operator=(const GcRoot &) = delete;
     GcRoot(GcRoot &&) = delete;
     GcRoot & operator=(GcRoot &&) = delete;
+
+private:
+    // Review CR5-#3 / CR2 (2026-07-22): remember which slot we registered so
+    // the destructor can pop OUR OWN entry rather than blindly popping the
+    // stack top.  The minor scavenger now walks this registry (review G1), so
+    // an out-of-order / heap-held destruction (two live EvalJobsHandles, or a
+    // rebuild-before-destroy) that blindly popped would leave a stale pointer
+    // the collector then dereferences.  Popping our own entry makes those
+    // patterns safe, not merely detected.
+    Value * registered_;
 };
 
 /// S1.2: root a CONTIGUOUS range of Values [data, data+n).  The canonical use is

@@ -20,6 +20,7 @@
 #include "v3/eval_jobs_api.hh"
 #include "v3/run.hh"
 #include "v3/vm.hh"
+#include "v3/errors.hh"   // CallDepthError (meta recursion guard, review CR6-D8)
 #include "v3/primop.hh"
 #include "v3/print.hh"
 #include "v3/alloc.hh"
@@ -184,6 +185,15 @@ EvalJobsHandlePtr makeHandleFromSource(nix::EvalState & state,
         Value selFn = forceValue(*h->vm, sr.value);
         Value applied = callClosure(*h->vm, selFn, h->root);
         h->root = forceValue(*h->vm, applied);
+        // Review CR6-D5 (2026-07-22): the tree-walker's initializeRootValue
+        // does `forceAttrs` on the --select result and hard-fails if it is
+        // not an attrset ("'--select' must evaluate to an attrset").  Without
+        // this check v3 would engage on a non-attrset select result and emit
+        // an empty jobset with exit 0.  Throw so the worker's engagement
+        // fallback reproduces the tree-walker's failure.
+        if (!h->root.isAttrs() || !h->root.asAttrs())
+            throw nix::Error(
+                "'--select' must evaluate to an attrset (the traversal root)");
     }
 
     return h;
@@ -252,7 +262,24 @@ void descendAttrPath(EvalJobsHandle & h, const std::vector<std::string> & path)
     for (const auto & seg : path) {
         Value cur = h.jobValue;                // rooted-slot snapshot
         if (!cur.isAttrs() || !cur.asAttrs())
+            // A non-attrset intermediate (a lambda, functor-less scalar, …):
+            // the tree-walker's findAlongAttrPath would autoCallFunction a
+            // lambda here and descend into its result.  We can't mirror that,
+            // so error — the worker's per-job TW retry (review CR7-R1) then
+            // re-descends correctly.
             throw nix::Error("v3 attrPath: '" + seg + "' is not under an attrset");
+        // Review CR6-D1 (2026-07-22): a `__functor` attrset at an INTERMEDIATE
+        // node is the silent-wrong-derivation hazard.  findAlongAttrPath
+        // autoCallFunction-unwraps it and looks `seg` up in the CALL RESULT;
+        // a raw lookup here would find `seg` in the functor's own attrs (a
+        // DIFFERENT, possibly shadowing value) with NO error.  Detect it
+        // (non-forcing presence probe) and throw so the worker retries this
+        // job on the tree-walker, which unwraps correctly.
+        static const SymbolId functorId = ir::globalInternSymbol("__functor");
+        if (cur.asAttrs()->lookup(functorId))
+            throw nix::Error(
+                "v3 attrPath: intermediate node '" + seg +
+                "' is a __functor attrset — tree-walker autoCall required");
         auto sid = ir::globalInternSymbol(seg);
         const Value * found = cur.asAttrs()->lookup(sid);
         if (!found)
@@ -502,8 +529,18 @@ namespace {
 /// same review), which REWRITES the registered holder in place; we then
 /// re-read `v.asList()` / `v.asAttrs()` per iteration.  Attr ids are
 /// collected first, then re-looked-up per id after each recursive force.
-bool checkMetaV3(VMState & vm, Value v)
+bool checkMetaV3(VMState & vm, Value v, unsigned depth = 0)
 {
+    // Review CR6-D8 (2026-07-22): the tree-walker's checkMeta recurses under
+    // `addCallDepth`, so pathologically-deep meta (e.g. `meta.x = foldl' (a: _:
+    // { inherit a; }) {} (range 1 200000)`) throws a StackOverflowError and
+    // nix-eval-jobs reports a deterministic per-job (fatal) error.  Unbounded
+    // C++ recursion here would instead overflow the native stack and CRASH the
+    // whole worker.  Bound it with the same ceiling as the VM's call-depth
+    // guard and throw the same type so the classification matches TW.
+    if (depth >= 10000)
+        throw CallDepthError(
+            "v3 checkMeta: stack overflow; meta nesting depth exceeded 10000");
     v = forceValue(vm, v);
     // Register the container holder for the recursive branches below: the
     // recursive checks force (and may scavenge — the minor scavenger walks
@@ -516,7 +553,7 @@ bool checkMetaV3(VMState & vm, Value v)
         return true;
     if (v.tag() == Tag::List && v.asList()) {
         for (uint32_t i = 0; i < v.asList()->size; ++i)
-            if (!checkMetaV3(vm, v.asList()->elems[i])) return false;
+            if (!checkMetaV3(vm, v.asList()->elems[i], depth + 1)) return false;
         return true;
     }
     if (v.isAttrs() && v.asAttrs()) {
@@ -526,7 +563,7 @@ bool checkMetaV3(VMState & vm, Value v)
         v.asAttrs()->forEachName([&](SymbolId id) { ids.push_back(id); });
         for (SymbolId id : ids) {
             const Value * p = v.asAttrs()->lookup(id);      // re-read post-force
-            if (!p || !checkMetaV3(vm, *p)) return false;
+            if (!p || !checkMetaV3(vm, *p, depth + 1)) return false;
         }
         return true;
     }
@@ -567,7 +604,12 @@ std::optional<nlohmann::json> meta(EvalJobsHandle & h)
     // Root the meta attrset: checkMetaV3/toJsonValue below deep-force and may
     // relocate it, and we re-look-up each entry from `m` after each force.
     V3_GC_ROOT(m);
-    if (!m.isAttrs() || !m.asAttrs()) return res;   // .meta not an attrset → null
+    // Review CR6-D6 (2026-07-22): the tree-walker's PackageInfo::getMeta does
+    // `forceAttrs(meta)`, which THROWS on a non-attrset `.meta` (→ per-job
+    // error).  Returning null here instead diverged silently; throw so the
+    // worker's TW retry reproduces TW's exact behavior.
+    if (!m.isAttrs() || !m.asAttrs())
+        throw nix::Error("v3 meta: the `meta` attribute is not an attribute set");
 
     const auto & symTab = ir::globalSymbolTable();
     std::vector<std::pair<std::string, SymbolId>> metaNames;
@@ -586,6 +628,15 @@ std::optional<nlohmann::json> meta(EvalJobsHandle & h)
         if (!mvp) continue;
         res[nm] = toJsonValue(vm, *mvp, symTab);           // null → object on 1st add
     }
+    // Review CR6-D10 (2026-07-22): a meta string with invalid UTF-8
+    // (e.g. `meta.description = readFile ./latin1-file`) makes nlohmann's
+    // dump() throw type_error.316.  The tree-walker serialises meta INSIDE
+    // its per-job try (printValueAsJSON) so that surfaces as a per-job error;
+    // v3 built the json here but the worker's first dump was `reply.dump()`
+    // OUTSIDE the per-job try → uncaught → worker CRASH.  Force the dump here,
+    // inside the per-job call path, converting the crash into a per-job error
+    // (which the worker's TW retry then reproduces exactly).
+    (void) res.dump();
     return res;
 }
 

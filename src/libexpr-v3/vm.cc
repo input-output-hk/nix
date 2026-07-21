@@ -186,7 +186,17 @@ namespace {
 /// noted here so future reviewers don't see "4096 here, 5000 there"
 /// and try to "fix" by unification.
 constexpr int    kMaxIndirectionChase = 100000;
-constexpr size_t kMaxCallDepth        = 5000;
+// Review CR7-C1 (2026-07-22): the tree-walker's `max-call-depth` setting
+// DEFAULTS TO 10000 (eval-settings.hh), not 5000 as an older comment here
+// claimed.  A 5000 ceiling made every job recursing 5001..10000 frames
+// (deep haskell.nix module fixpoints, long foldr) throw where stock nix
+// succeeds — and since nix-eval-jobs maps the resulting CallDepthError
+// FATAL, that aborted the WHOLE Hydra evaluation.  Match TW's default so
+// the ceilings coincide (both abort only past 10000).  Kept a constant
+// rather than wired to evalSettings.maxCallDepth because v3 has no Settings
+// surface; 10000 is the shipped TW default and the value that restores
+// parity.  If a jobset overrides max-call-depth, re-evaluate.
+constexpr size_t kMaxCallDepth        = 10000;
 
 /// eval/apply (#3): is `v` an under-applied multi-arity closure — an App /
 /// App3 chain App(…App(closure, a0)…, a_{d-1}) whose leaf is a Closure of
@@ -8506,7 +8516,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 const Closure * c = fun.asClosure();
                 const LambdaDescriptor * d = c->desc;
                 if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
-                    throw std::runtime_error(
+                    throw CallDepthError(
                         "v3 OP_CALL_N: stack overflow; call depth exceeded "
                         + std::to_string(kMaxCallDepth));
                 vm.frames.back().ip = ip;
@@ -9889,7 +9899,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // recursion that doesn't go through OP_CALL (e.g. `let x = x;
             // in x`, where every reference to x re-enters via OP_FORCE).
             if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
-                throw std::runtime_error("v3 OP_FORCE: stack overflow; call depth exceeded "
+                throw CallDepthError("v3 OP_FORCE: stack overflow; call depth exceeded "
                                           + std::to_string(kMaxCallDepth));
 
             // REVIEW §3: window between `t->state = Blackhole` and the
@@ -14781,7 +14791,7 @@ Value forceValue(VMState & vm, Value v)
         // and never grows through the bytecode-level OP_CALL/OP_FORCE
         // guards.  Match those guards.
         if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
-            throw std::runtime_error("v3 forceValue: stack overflow; call depth exceeded "
+            throw CallDepthError("v3 forceValue: stack overflow; call depth exceeded "
                                       + std::to_string(kMaxCallDepth));
         // Tag::Slot — SECD-style indirection.  The slot pointer
         // references another stable Value that gets mutated when its
@@ -15741,7 +15751,7 @@ static bool callClosureNExact(
         return false;
 
     if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
-        throw std::runtime_error(
+        throw CallDepthError(
             "v3 callClosureNExact: stack overflow; call depth exceeded "
             + std::to_string(kMaxCallDepth));
 
