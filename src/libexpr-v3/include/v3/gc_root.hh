@@ -141,6 +141,7 @@ private:
 /// Non-copyable/movable.
 class GcRootRange
 {
+    Value * data_;   // base of the contiguous run we pushed (for erase-own)
     size_t n_;
 public:
     GcRootRange(Value * data, size_t n) noexcept;
@@ -161,6 +162,7 @@ public:
 /// construction.  Each element is walked + rewritten in place.  RAII register/unregister.
 class GcRootVec
 {
+    std::vector<Value> * registered_;   // the vector we registered (for erase-own)
 public:
     explicit GcRootVec(std::vector<Value> & v) noexcept;
     ~GcRootVec() noexcept;

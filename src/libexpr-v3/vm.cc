@@ -170,7 +170,8 @@ namespace {
 ///    so subsequent forces hit in O(1) — see opForceCompress* for the
 ///    analogous compression on Evaluated thunks.
 ///
-/// 2. `kMaxCallDepth` (5000): max number of CallFrame entries on
+/// 2. `kMaxCallDepth` (10000 — see the CR7-C1 note below; was 5000): max
+///    number of CallFrame entries on
 ///    `vm.frames`.  Mirrors tree-walker's recursive C-stack guard.
 ///    Triggered by deeply recursive evaluation (e.g., infinite
 ///    `let f = x: f x; in f 0` chains that aren't tail-call-
@@ -7764,9 +7765,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
 
             // Max call-depth check — guards `(x: x x) (x: x x)` and
-            // similar non-thunk-mediated infinite recursion.  Tree-walker
-            // defaults to 5000; we match that via kMaxCallDepth (see
-            // anonymous namespace at top of file).  Cheap O(1) check.
+            // similar non-thunk-mediated infinite recursion.  Tree-walker's
+            // max-call-depth defaults to 10000; we match that via kMaxCallDepth
+            // (see the CR7-C1 note in the anonymous namespace at top of file).
+            // Cheap O(1) check.
             if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
                 throw CallDepthError("v3 OP_CALL: stack overflow; call depth exceeded "
                                           + std::to_string(kMaxCallDepth));
@@ -14419,7 +14421,8 @@ Value forceValue(VMState & vm, Value v)
     // forceValue call sites (OP_CALL's `fun` force, callClosure's
     // primop arg loop, helpers like valueEqual).  Those sites are
     // shallow per-opcode-call, so VM frame depth dominates and the
-    // existing `kMaxCallDepth` (5000) clean-throw guard at
+    // existing `kMaxCallDepth` (10000; was 5000 — see the CR7-C1 note at the
+    // top of file) clean-throw guard at
     // dispatchLoop:3160 / 4662 and forceValue:8526 is sufficient.
     //
     // Opt-in logging via NIX_V3_LOG_DEPTH=1 (peak every +100 frames).

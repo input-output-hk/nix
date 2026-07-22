@@ -57,7 +57,7 @@ GcRoot::GcRoot(Value * p) noexcept
 }
 
 GcRootRange::GcRootRange(Value * data, size_t n) noexcept
-    : n_(data ? n : 0)
+    : data_(data), n_(data ? n : 0)
 {
     auto & s = gcRootStack();
     s.reserve(s.size() + n_);
@@ -66,21 +66,42 @@ GcRootRange::GcRootRange(Value * data, size_t n) noexcept
 
 GcRootRange::~GcRootRange() noexcept
 {
-    // LIFO: pop exactly the n_ entries we pushed (defensive against an empty
-    // stack, mirroring GcRoot::~GcRoot).
+    // Erase OUR OWN run of n_ entries (review RR2-c5/RR5-4, 2026-07-22 —
+    // matches GcRoot::~GcRoot's erase-own hardening).  Common case: our run is
+    // the LIFO top → an O(n_) tail pop.  Out-of-order / heap-held destruction
+    // (a longer-lived GcRoot pushed after us) would make a blind pop drop a
+    // stranger's live slots and leave ours dangling for the scavenger's
+    // registry walk.  Match by our recorded base pointers &data_[0..n_).
     auto & s = gcRootStack();
-    for (size_t i = 0; i < n_ && !s.empty(); ++i) s.pop_back();
+    for (size_t i = 0; i < n_; ++i) {
+        Value * want = &data_[n_ - 1 - i];   // reverse push order
+        if (!s.empty() && s.back() == want) { s.pop_back(); continue; }
+        for (auto it = s.end(); it != s.begin(); ) {
+            --it;
+            if (*it == want) { s.erase(it); break; }
+        }
+    }
 }
 
 GcRootVec::GcRootVec(std::vector<Value> & v) noexcept
+    : registered_(&v)
 {
     gcRootVecStack().push_back(&v);
 }
 
 GcRootVec::~GcRootVec() noexcept
 {
+    // Erase OUR OWN entry (review RR2-c5/RR5-4, 2026-07-22 — matches
+    // GcRoot::~GcRoot).  A blind top-pop would unroot a stranger's growing
+    // accumulator under out-of-order/heap-held destruction; find-and-erase
+    // our recorded vector pointer handles every ordering.
     auto & s = gcRootVecStack();
-    if (!s.empty()) s.pop_back();
+    if (s.empty()) return;
+    if (s.back() == registered_) { s.pop_back(); return; }
+    for (auto it = s.end(); it != s.begin(); ) {
+        --it;
+        if (*it == registered_) { s.erase(it); return; }
+    }
 }
 
 GcRoot::~GcRoot() noexcept
