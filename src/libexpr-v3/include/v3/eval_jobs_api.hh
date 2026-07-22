@@ -29,13 +29,19 @@
 /// CompilationUnit(s), a `VMState`, and the GC-rooted root + job Values.
 /// Keep it alive for the whole worker's lifetime.
 ///
-/// CONSTRAINT — at most ONE live handle per thread, destroy-before-rebuild
-/// (review A6, 2026-07-20): the handle's two GcRoot registrations live on a
-/// strictly-LIFO thread-local stack whose RAII destructor pops the TOP entry
-/// blindly.  A second concurrent handle, or constructing a replacement
-/// handle before destroying the old one, interleaves push/pop and silently
-/// unroots the other handle's slots.  nix-eval-jobs' worker satisfies this
-/// (one handle; rebuild does `reset()` first).
+/// CONSTRAINT — thread affinity (review A6, 2026-07-20; rationale corrected
+/// RR2/RR5/RR9, 2026-07-22): the handle's two GcRoot registrations live on a
+/// THREAD-LOCAL stack.  `GcRoot::~GcRoot` erases its OWN entry (find-and-erase,
+/// NOT a blind LIFO pop — CR5-#3), so out-of-order or heap-held destruction of
+/// a handle is safe and a replacement handle may even be built before the old
+/// one is destroyed.  What IS load-bearing is thread affinity: a handle must be
+/// created, driven, AND destroyed on the SAME thread — the minor scavenger only
+/// walks the CURRENT thread's GcRoot registry, so a handle driven from another
+/// thread keeps unforwarded (dangling) slots, and one destroyed on another
+/// thread orphans two entries in the origin thread's registry.  nix-eval-jobs'
+/// forked single-threaded workers satisfy this trivially (one handle,
+/// created/used/destroyed on the worker's main thread; rebuild does reset()
+/// first, which is no longer required for correctness but stays as convention).
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0

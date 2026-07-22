@@ -140,7 +140,8 @@ namespace {
 EvalJobsHandlePtr makeHandleFromSource(nix::EvalState & state,
                                        const std::string & src,
                                        const std::string & fragment,
-                                       const std::string & selectExpr)
+                                       const std::string & selectExpr,
+                                       bool guardExprRoot = false)
 {
     EvalJobsHandlePtr h(new EvalJobsHandle());
     h->vm = std::make_unique<VMState>();
@@ -174,6 +175,31 @@ EvalJobsHandlePtr makeHandleFromSource(nix::EvalState & state,
         if (!found)
             throw nix::Error("v3 flake root: fragment attribute '" + seg + "' not found");
         h->root = forceValue(*h->vm, *found);
+    }
+
+    // Root-shape guard for the `--expr` route — MUST run on the PRE-select
+    // root (RR6-S6 / RR9-1, 2026-07-22).  The tree-walker's
+    // releaseExprTopLevelValue auto-calls the RAW expression root
+    // (autoCallFunction: CALLS a lambda root with all-defaulted formals,
+    // unwraps a functor attrset) BEFORE it applies `--select`; if v3 applied
+    // `--select` first and then inspected the post-select root, a select
+    // function that tolerates a function argument would yield a DIFFERENT
+    // traversal root with no error (unhealable — the divergence is in the
+    // per-worker root, not a per-job throw).  Those auto-call semantics are
+    // TW-only, so throw here (→ worker engagement fallback to the tree-walker)
+    // for exact parity.  An attrset root (Hydra's hydraJobs) is a no-op under
+    // autoCallFunction with empty autoArgs, so v3 proceeds for that shape.
+    if (guardExprRoot) {
+        Value root = h->root;
+        bool needsTw = root.tag() == Tag::Closure;
+        if (!needsTw && root.isAttrs() && root.asAttrs()) {
+            static const SymbolId functorId = ir::globalInternSymbol("__functor");
+            needsTw = root.asAttrs()->lookup(functorId) != nullptr;
+        }
+        if (needsTw)
+            throw nix::Error(
+                "v3 expr root is a function/functor — tree-walker "
+                "autoCallFunction semantics required");
     }
 
     // --select: evaluate the lambda and apply it to the (post-fragment)
@@ -225,28 +251,10 @@ EvalJobsHandlePtr evalExprRoot(nix::EvalState & state,
     // ordinary v3 evaluation).  Hydra pre-locks the URL via `nix flake
     // metadata`, so drvPath identity is preserved without any
     // InstallableFlake machinery.
-    EvalJobsHandlePtr h = makeHandleFromSource(state, exprSrc, "", selectExpr);
-
-    // Root-shape guard: the tree-walker's non-flake route auto-calls the
-    // root (releaseExprTopLevelValue → autoCallFunction), which CALLS a
-    // lambda root with all-defaulted formals and unwraps a functor attrset
-    // root.  Those semantics are TW-only — throw so the worker's engagement
-    // catch falls back to the tree-walker for exact parity (an attrset root
-    // — hydra's hydraJobs — is a no-op under autoCallFunction with empty
-    // autoArgs, so v3 proceeds for the production shape).
-    {
-        Value root = h->root;
-        bool needsTw = root.tag() == Tag::Closure;
-        if (!needsTw && root.isAttrs() && root.asAttrs()) {
-            static const SymbolId functorId = ir::globalInternSymbol("__functor");
-            needsTw = root.asAttrs()->lookup(functorId) != nullptr;
-        }
-        if (needsTw)
-            throw nix::Error(
-                "v3 expr root is a function/functor — tree-walker "
-                "autoCallFunction semantics required");
-    }
-    return h;
+    // The root-shape guard runs INSIDE makeHandleFromSource on the pre-select
+    // root (guardExprRoot=true) — see the rationale there (RR6-S6/RR9-1).
+    return makeHandleFromSource(state, exprSrc, "", selectExpr,
+                                /*guardExprRoot=*/true);
 }
 
 // ---------------------------------------------------------------------------
@@ -260,8 +268,36 @@ void descendAttrPath(EvalJobsHandle & h, const std::vector<std::string> & path)
     // slot so every intermediate is forwarded across scavenges.
     h.jobValue = forceValue(vm, h.root);
     for (const auto & seg : path) {
-        Value cur = h.jobValue;                // rooted-slot snapshot
-        if (!cur.isAttrs() || !cur.asAttrs())
+        // Numeric-segment parity (RR6-S1 / RR1-F7, 2026-07-22): TW's
+        // findAlongAttrPath parses every path segment with
+        // `string2Int<unsigned int>` and, when it parses, treats the segment
+        // as a LIST INDEX — hard-erroring "should be a list but is a set" when
+        // the current value is an attrset.  nix-eval-jobs only ever produces a
+        // numeric segment from a numeric ATTR NAME while recursing an attrset
+        // (collectAttrsForRecursion never descends lists), so TW ALWAYS errors
+        // on such a segment.  v3 would instead look the name up and silently
+        // emit a job — a divergence the per-job TW-retry net (CR7-R1) cannot
+        // heal because v3 doesn't throw.  Mirror TW: throw so the worker
+        // retries on the tree-walker and reproduces TW's error bytes exactly.
+        //
+        // We call the SAME `nix::string2Int<unsigned int>` TW uses, so the
+        // "is this a list index?" classification is byte-parity-exact.  It is
+        // NOT explicitly `#include`d: the `lint-no-direct-tw-include` V3-native
+        // ratchet forbids a new `#include "nix/…"` in this file, and the
+        // header-only template is transitively visible via ffi.hh (the same
+        // path this file already relies on for `nix::Error`/`nix::EvalState`).
+        // Do not "fix" this by adding the include — it will fail lint.
+        if (nix::string2Int<unsigned int>(seg))
+            throw nix::Error(
+                "v3 attrPath: numeric segment '" + seg + "' is a list index "
+                "under the tree-walker — tree-walker semantics required");
+        // Re-read the GC-rooted job slot on every step.  A `lookup` below can
+        // realise a MapAttrs entry and allocate; snapshotting the Bindings*
+        // into an unrooted local would dangle the moment a scavenge relocates
+        // it (safe today only because the scavenger never fires at accessor
+        // depth — gc_root.hh's Stage-6 caveat — but the rooted slot is
+        // unconditionally correct; RR6-L1 / RR1-F5, 2026-07-22).
+        if (!h.jobValue.isAttrs() || !h.jobValue.asAttrs())
             // A non-attrset intermediate (a lambda, functor-less scalar, …):
             // the tree-walker's findAlongAttrPath would autoCallFunction a
             // lambda here and descend into its result.  We can't mirror that,
@@ -276,12 +312,12 @@ void descendAttrPath(EvalJobsHandle & h, const std::vector<std::string> & path)
         // (non-forcing presence probe) and throw so the worker retries this
         // job on the tree-walker, which unwraps correctly.
         static const SymbolId functorId = ir::globalInternSymbol("__functor");
-        if (cur.asAttrs()->lookup(functorId))
+        if (h.jobValue.asAttrs()->lookup(functorId))
             throw nix::Error(
                 "v3 attrPath: intermediate node '" + seg +
                 "' is a __functor attrset — tree-walker autoCall required");
         auto sid = ir::globalInternSymbol(seg);
-        const Value * found = cur.asAttrs()->lookup(sid);
+        const Value * found = h.jobValue.asAttrs()->lookup(sid);
         if (!found)
             throw nix::Error("v3 attrPath: attribute '" + seg + "' not found");
         h.jobValue = forceValue(vm, *found);   // back into the rooted slot
@@ -366,8 +402,12 @@ bool jobNeedsTreeWalker(EvalJobsHandle & h, bool wantConstituents)
     // Review F2+F4 (2026-07-20): three job shapes whose tree-walker semantics
     // are NOT mirrored by the v3 accessors; the worker routes them through the
     // original TW path (lazy TW root) for exact parity instead of silently
-    // diverging.  All three checks are non-forcing presence/tag tests on the
-    // already-WHNF rooted job slot (alloc-free — no GC hazard).
+    // diverging.  All checks read the GC-rooted job slot directly: `lookup`
+    // can realise a MapAttrs entry and allocate, so re-read h.jobValue.asAttrs()
+    // at each step rather than caching an unrooted Bindings* (RR6-L1/RR1-F5,
+    // 2026-07-22 — corrects the earlier "alloc-free" claim; safe today only
+    // because the scavenger never fires at accessor depth, but the rooted slot
+    // is unconditionally correct if that ever changes).
     //
     //  1. lambda job values: TW's per-job autoCallFunction CALLS a lambda with
     //     all-defaulted formals (descending into its result) and hard-errors
@@ -381,14 +421,13 @@ bool jobNeedsTreeWalker(EvalJobsHandle & h, bool wantConstituents)
     //     extraction needs coerceToString-with-context on a TW Value; emitting
     //     the aggregate WITHOUT its constituents would silently produce empty
     //     aggregate builds in Hydra — the worst failure mode.
-    Value v = h.jobValue;
-    if (v.tag() == Tag::Closure) return true;                      // (1)
-    if (v.isAttrs() && v.asAttrs()) {
+    if (h.jobValue.tag() == Tag::Closure) return true;                 // (1)
+    if (h.jobValue.isAttrs() && h.jobValue.asAttrs()) {
         static const SymbolId functorId = ir::globalInternSymbol("__functor");
-        if (v.asAttrs()->lookup(functorId)) return true;           // (2)
+        if (h.jobValue.asAttrs()->lookup(functorId)) return true;      // (2)
         if (wantConstituents) {
             static const SymbolId aggId = ir::globalInternSymbol("_hydraAggregate");
-            if (v.asAttrs()->lookup(aggId)) return true;           // (3)
+            if (h.jobValue.asAttrs()->lookup(aggId)) return true;      // (3)
         }
     }
     return false;
@@ -428,6 +467,14 @@ std::string name(EvalJobsHandle & h)
     Value nv = forceValue(vm, *n);
     if (nv.tag() != Tag::String || !nv.asString())
         throw nix::Error("v3 name: 'name' did not evaluate to a string");
+    // TW's queryName uses forceStringNoCtx (RR6-S3, 2026-07-22): a `name`
+    // carrying string context is a hard error ("is not allowed to refer to a
+    // store path").  v3 keeps context in a side table the Tag::String value
+    // doesn't carry inline — consult it and throw so the TW-retry net
+    // reproduces TW's rejection instead of silently emitting the job.
+    if (auto * ctx = lookupStringContextEntries(nv.asString()); ctx && !ctx->empty())
+        throw nix::Error(
+            "v3 name: the 'name' attribute is not allowed to refer to a store path");
     return std::string(nv.asString());
 }
 
@@ -440,7 +487,19 @@ std::string system(EvalJobsHandle & h)
     const Value * s = v.asAttrs()->lookup(sysId);
     if (!s) return "unknown";                   // mirrors querySystem's default
     Value sv = forceValue(vm, *s);
-    if (sv.tag() != Tag::String || !sv.asString()) return "unknown";
+    // TW's querySystem uses forceStringNoCtx when `system` is PRESENT (RR6-S4,
+    // 2026-07-22): a present-but-non-string (or context-carrying) `system` is
+    // a hard error, not a silent "unknown".  Only reached in read-only-store
+    // mode (Hydra's local-store deploy takes the readDerivation branch and
+    // never calls this), but throw for parity so the TW-retry net matches.
+    if (sv.tag() != Tag::String || !sv.asString())
+        throw nix::Error(
+            "while evaluating the 'system' attribute of a derivation: "
+            "value is not a string");
+    if (auto * ctx = lookupStringContextEntries(sv.asString()); ctx && !ctx->empty())
+        throw nix::Error(
+            "while evaluating the 'system' attribute of a derivation: "
+            "the value is not allowed to refer to a store path");
     return std::string(sv.asString());
 }
 
@@ -455,40 +514,57 @@ std::vector<std::pair<std::string, std::string>> outputs(EvalJobsHandle & h)
     static const SymbolId outputsId = ir::globalInternSymbol("outputs");
     static const SymbolId outPathId = ir::globalInternSymbol("outPath");
 
-    // First collect the output NAMES (into std::strings, so we hold no v3
-    // pointer across the per-output forces below).
-    std::vector<std::string> names;
-    {
-        const Value * outsV = h.jobValue.asAttrs()->lookup(outputsId);
-        if (outsV) {
-            Value outs = forceValue(vm, *outsV);
-            // Review A3 (2026-07-20): register the by-value list holder so a
-            // scavenge fired inside a per-element force rewrites `outs` in
-            // place (the minor scavenger walks the GcRoot registry as of the
-            // same review), and RE-READ asList() each iteration instead of
-            // caching the ListVec* — a cached pointer would dangle the
-            // moment the list cell is forwarded.
-            V3_GC_ROOT(outs);
-            if (outs.tag() == Tag::List && outs.asList()) {
-                for (uint32_t i = 0; i < outs.asList()->size; ++i) {
-                    Value e = forceValue(vm, outs.asList()->elems[i]);
-                    if (e.tag() == Tag::String && e.asString())
-                        names.emplace_back(e.asString());
-                }
-            }
-        }
+    // Mirror PackageInfo::queryOutputs(withPaths=true) decision-for-decision
+    // (RR6-S2 / RR1-F3, 2026-07-22).  The prior version was SHAPE-LAX where TW
+    // is strict — it silently skipped malformed entries and fell back to the
+    // top-level outPath — producing a job with wrong/partial/empty outputs
+    // where TW hard-errors (and an all-empty `"outputs":{}` even trips Hydra's
+    // own `die unless scalar @outputNames`).  A throw here is healed by the
+    // worker's per-job TW-retry (CR7-R1) into byte-exact TW output.
+    const Value * outsV = h.jobValue.asAttrs()->lookup(outputsId);
+    if (!outsV) {
+        // No `.outputs` attribute → single "out" from the top-level
+        // `.outPath` (queryOutputs' else-branch → queryOutPath, which THROWS
+        // "derivation does not have attribute 'outPath'" when it is absent).
+        const Value * opV = h.jobValue.asAttrs()->lookup(outPathId);
+        if (!opV)
+            throw nix::Error("derivation does not have attribute 'outPath'");
+        Value op = forceValue(vm, *opV);
+        std::string s = valueToPathString(op);
+        if (s.empty())
+            throw nix::Error(
+                "while evaluating the output path of a derivation: "
+                "value is not coercible to a store path");
+        result.emplace_back("out", std::move(s));
+        return result;
     }
 
-    if (names.empty()) {
-        // No `.outputs` list → single "out" whose path is the top-level
-        // `.outPath` (mirrors queryOutputs' else-branch → queryOutPath).
-        const Value * opV = h.jobValue.asAttrs()->lookup(outPathId);
-        if (opV) {
-            Value op = forceValue(vm, *opV);
-            std::string s = valueToPathString(op);
-            if (!s.empty()) result.emplace_back("out", std::move(s));
-        }
-        return result;
+    // `.outputs` present: TW's forceList THROWS if it is not a list.  Register
+    // the by-value list holder so a scavenge fired inside a per-element force
+    // rewrites `outs` in place (the minor scavenger walks the GcRoot registry),
+    // and RE-READ asList() each iteration rather than caching the ListVec*.
+    Value outs = forceValue(vm, *outsV);
+    V3_GC_ROOT(outs);
+    if (outs.tag() != Tag::List || !outs.asList())
+        throw nix::Error(
+            "while evaluating the 'outputs' attribute of a derivation: "
+            "value is not a list");
+
+    // Collect output NAMES.  TW's forceStringNoCtx THROWS on a non-string
+    // element and on a context-carrying string; mirror both (into std::strings
+    // so we hold no v3 pointer across the per-output forces below).
+    std::vector<std::string> names;
+    for (uint32_t i = 0; i < outs.asList()->size; ++i) {
+        Value e = forceValue(vm, outs.asList()->elems[i]);
+        if (e.tag() != Tag::String || !e.asString())
+            throw nix::Error(
+                "while evaluating the name of an output of a derivation: "
+                "value is not a string");
+        if (auto * ctx = lookupStringContextEntries(e.asString()); ctx && !ctx->empty())
+            throw nix::Error(
+                "while evaluating the name of an output of a derivation: "
+                "the name is not allowed to refer to a store path");
+        names.emplace_back(e.asString());
     }
 
     for (const auto & o : names) {
@@ -496,14 +572,23 @@ std::vector<std::pair<std::string, std::string>> outputs(EvalJobsHandle & h)
         // force may have relocated its Bindings.
         auto oid = ir::globalInternSymbol(o);
         const Value * subV = h.jobValue.asAttrs()->lookup(oid);
-        if (!subV) continue;                    // mirrors queryOutputs' `continue`
+        if (!subV) continue;                    // TW: `continue` (missing output)
         Value sub = forceValue(vm, *subV);
-        if (!sub.isAttrs() || !sub.asAttrs()) continue;
+        // TW's forceAttrs THROWS if the output is not an attrset.
+        if (!sub.isAttrs() || !sub.asAttrs())
+            throw nix::Error(
+                "while evaluating an output of a derivation: value is not an attrset");
         const Value * opV = sub.asAttrs()->lookup(outPathId);
-        if (!opV) continue;
+        if (!opV) continue;                     // TW: `continue` (missing outPath)
         Value op = forceValue(vm, *opV);
         std::string s = valueToPathString(op);
-        if (s.empty()) continue;
+        // TW's coerceToStorePath THROWS on a non-coercible outPath.  The
+        // common String/Path shape coerces directly here; the rarer
+        // coercible-attrset shape is healed by the TW-retry net.
+        if (s.empty())
+            throw nix::Error(
+                "while evaluating an output path of a derivation: "
+                "value is not coercible to a store path");
         result.emplace_back(o, std::move(s));
     }
     return result;
