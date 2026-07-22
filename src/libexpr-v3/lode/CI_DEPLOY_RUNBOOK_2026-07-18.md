@@ -129,3 +129,53 @@ evaluator_max_memory_size = 3072;   # was 1024 — RAISED for v3 (see below); NO
 - **Default-on IFD visibility** (WS-2) + **realise-context correctness** (WS-1) — the evaluator IS the IFD-heavy path (`allow_import_from_derivation=true`).
 - Warm re-eval cache moat (WS-3) for the same jobset re-evaluated each push.
 - **Not** single-eval speed (still ~1.8–2.5× TW CPU) — the win is fleet density + visibility, not per-eval latency.
+
+---
+
+## 6. Round-3 review deltas (2026-07-22) — procedure changes
+
+These OVERRIDE the earlier text where they conflict:
+
+- **`colmena apply --on linux-0` now builds ON THE TARGET.** linux-0 gained
+  `deployment.buildOnTarget = true` (RR10-RISK1).  Without it the apply built
+  the whole v3 nix + hydra + nej stack under the Mac's Rosetta VM (incl. nej's
+  doCheck gtest) because the preflight closure is not on cache.zw3rk.com.  The
+  32 GB Beelink builds it natively; the "one command" is now real.
+- **Kill-switch = `NIX_V3_DIRECT_EVAL=0`** (value-parsed as of round-3;
+  0/false/no/off ⇒ off).  Flip it in `modules/web-service-hydra.nix` +
+  `colmena apply --on linux-0` to disable v3 in place — no env-var removal
+  needed.  (Previously `=0` silently KEPT v3 engaged.)
+- **Rollback MUST keep the `doCheck = false` hunk.** Reverting the deploy
+  commit wholesale re-arms the everything-package test gate, and the OLD nix
+  pin's package ALSO fails GitTest/DirectoryIterator when rebuilt today
+  (environmental, A/B-proven v3-independent).  Revert ONLY the input pins + the
+  v3 evaluator env; leave `nix.package = … .overrideAttrs (_: { doCheck =
+  false; doInstallCheck = false; })` in place (RR10-RISK3).  With
+  buildOnTarget the rollback also builds on linux-0.
+- **Memory backstop:** hydra-evaluator now caps at `MemoryHigh=24G` /
+  `MemoryMax=28G` / `OOMScoreAdjust=500` (RR10-RISK2) so a mid-job runaway can't
+  OOM-kill postgres — reclaim/kill stays inside the eval cgroup (a killed worker
+  fails at most that eval; hydra retries).  TUNE these against observed
+  haskell.nix worker peaks once real evals run; if legit big evals get killed,
+  raise them or drop `evaluator_workers`.
+- **Eval watchdog now actually fires.** The 3 h stuck-eval killer matched a
+  truncated comm wrong and never ran (RR7-C3); fixed to prefix-match + reap
+  orphaned nix-eval-jobs workers.
+- **Deployed evaluator is the RELEASE build** (`v3_release=true` in
+  package.nix, RR4-R3) — always-on instrumentation stripped, env-gated
+  diagnostics (NIX_VM_OPCOUNTS, V3_DBG_*) still available on demand.  Re-gated
+  green on the release codegen.
+- **RESIDUAL RISK — v3 worker hard-crash (RR1-F2):** the per-job TW-retry net
+  catches C++ EXCEPTIONS only.  A deterministic SIGSEGV/SIGBUS inside the v3 VM
+  or a kernel OOM-kill mid-job lands in `handleBrokenWorkerPipe` →
+  WHOLE-EVAL failure (upstream TW had no such class).  Mitigations in place: the
+  staged rollout (shadow → canary → full) surfaces it before production trust,
+  and the kill-switch above is the immediate out.  If a jobset repeatedly aborts
+  with worker-pipe errors, flip the kill-switch and file it.  Post-deploy
+  hardening (not built): a collector-side signal-death counter that re-forks the
+  worker with v3 disabled after N crashes.
+- **TOP core follow-up (NOT a deploy blocker) — RR5-1:** a pre-existing
+  v3-core `forceWriteTarget`-into-nursery write-after-scavenge hazard (deepForceList
+  path), covered by the `--brute` nursery-audit stress gate but disputed by
+  RR5's static analysis vs the prior GC_AUDIT_ROUND_2 #6 conclusion.  Needs a
+  dedicated repro to adjudicate; independent of the CI-integration work.

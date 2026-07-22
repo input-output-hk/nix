@@ -120,6 +120,17 @@ mkMesonLibrary (finalAttrs: {
   doCheck = false;
   doInstallCheck = false;
 
+  # Ship the RELEASE build (RR4-R3, 2026-07-22): strip the always-on
+  # instrumentation (per-alloc byte counters, attrset-size buckets,
+  # V3_STATS_* in the hot VM paths) that the meson `v3_release` option
+  # defaults OFF.  Correctness-neutral (the stripped macros are diagnostic-
+  # only; env-gated diagnostics like NIX_VM_OPCOUNTS still compile + work on
+  # demand), so the deployed evaluator carries no always-on measurement tax.
+  # Re-gated on the release build: --brute + shadow parity green.
+  mesonFlags = [
+    (lib.mesonBool "v3_release" true)
+  ];
+
   meta = {
     # v3 is unix-only: the v3-eval stack-size link flag and the moving-GC
     # substrate are not exercised on Windows.  (The nix CLI still lists

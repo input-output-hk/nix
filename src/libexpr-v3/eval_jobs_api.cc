@@ -280,13 +280,14 @@ void descendAttrPath(EvalJobsHandle & h, const std::vector<std::string> & path)
         // heal because v3 doesn't throw.  Mirror TW: throw so the worker
         // retries on the tree-walker and reproduces TW's error bytes exactly.
         //
-        // We call the SAME `nix::string2Int<unsigned int>` TW uses, so the
-        // "is this a list index?" classification is byte-parity-exact.  It is
-        // NOT explicitly `#include`d: the `lint-no-direct-tw-include` V3-native
-        // ratchet forbids a new `#include "nix/…"` in this file, and the
-        // header-only template is transitively visible via ffi.hh (the same
-        // path this file already relies on for `nix::Error`/`nix::EvalState`).
-        // Do not "fix" this by adding the include — it will fail lint.
+        // We call the SAME nix::string2Int<unsigned int> TW uses, so the
+        // "is this a list index?" classification is byte-parity-exact.  There
+        // is deliberately no explicit header include for it: the
+        // lint-no-direct-tw-include V3-native ratchet forbids adding a new
+        // nix/ header include to this file, and the header-only template is
+        // transitively visible via ffi.hh (the same path this file already
+        // relies on for nix::Error / nix::EvalState).  Do NOT add a nix/ header
+        // include to "fix" this — it will fail that lint.
         if (nix::string2Int<unsigned int>(seg))
             throw nix::Error(
                 "v3 attrPath: numeric segment '" + seg + "' is a list index "

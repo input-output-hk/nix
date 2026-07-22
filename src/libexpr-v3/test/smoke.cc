@@ -1442,6 +1442,16 @@ static void smokeSecondPlusOne(EvalState & state, Value * args, Value & out)
 
 static int testPrimMapAttrsNamesDoNotRealize()
 {
+#ifdef V3_RELEASE
+    // Instrumentation-gated (RR4-R3, 2026-07-22): asserts on
+    // allocStats().pairsAllocated (App3-memoization / MapAttrs-realize pair
+    // counts), which V3_RELEASE compiles to zero.  The primop eval behavior is
+    // covered on the release binary by the shadow-parity gate (real mapAttrs/
+    // attrValues/intersectAttrs/removeAttrs evals) and fully asserted in the
+    // default build's --brute.  Skip so --brute is clean under V3_RELEASE.
+    std::fprintf(stderr, "testPrimMapAttrsNamesDoNotRealize: SKIPPED under V3_RELEASE (instrumentation-gated)\n");
+    return 0;
+#endif
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
     const PrimOp * attrNamesPo = findPrimOp("attrNames");
     if (!mapAttrsPo || !attrNamesPo) {
@@ -1536,6 +1546,13 @@ static int testPrimMapAttrsNamesDoNotRealize()
 
 static int testPrimMapAttrsNestedNamesDoNotRealize()
 {
+#ifdef V3_RELEASE
+    // Instrumentation-gated (RR4-R3): asserts on allocStats().pairsAllocated
+    // (compiled to zero under V3_RELEASE); behavior covered by shadow parity +
+    // the default build's --brute.  Skip for a clean release --brute.
+    std::fprintf(stderr, "testPrimMapAttrsNestedNamesDoNotRealize: SKIPPED under V3_RELEASE (instrumentation-gated)\n");
+    return 0;
+#endif
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
     const PrimOp * attrNamesPo = findPrimOp("attrNames");
     if (!mapAttrsPo || !attrNamesPo) {
@@ -1639,6 +1656,13 @@ static int testPrimMapAttrsNestedNamesDoNotRealize()
 
 static int testPrimAttrValuesMapAttrsSortsWithOneAppPerValue()
 {
+#ifdef V3_RELEASE
+    // Instrumentation-gated (RR4-R3): asserts on allocStats().pairsAllocated
+    // (compiled to zero under V3_RELEASE); behavior covered by shadow parity +
+    // the default build's --brute.  Skip for a clean release --brute.
+    std::fprintf(stderr, "testPrimAttrValuesMapAttrsSortsWithOneAppPerValue: SKIPPED under V3_RELEASE (instrumentation-gated)\n");
+    return 0;
+#endif
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
     const PrimOp * attrValuesPo = findPrimOp("attrValues");
     if (!mapAttrsPo || !attrValuesPo) {
@@ -2101,6 +2125,13 @@ static int testPrimMapAttrsUpdateNoApp3()
 
 static int testPrimMapAttrsNestedSelectUsesMappedValue()
 {
+#ifdef V3_RELEASE
+    // Instrumentation-gated (RR4-R3): asserts on allocStats().pairsAllocated
+    // (compiled to zero under V3_RELEASE); behavior covered by shadow parity +
+    // the default build's --brute.  Skip for a clean release --brute.
+    std::fprintf(stderr, "testPrimMapAttrsNestedSelectUsesMappedValue: SKIPPED under V3_RELEASE (instrumentation-gated)\n");
+    return 0;
+#endif
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
     if (!mapAttrsPo) {
         std::fprintf(stderr,
@@ -2221,6 +2252,13 @@ static int testPrimMapAttrsSetOpsNoApp3()
 
 static int testPrimIntersectAttrsMapAttrsChainCopy()
 {
+#ifdef V3_RELEASE
+    // Instrumentation-gated (RR4-R3): asserts on allocStats().pairsAllocated
+    // (compiled to zero under V3_RELEASE); behavior covered by shadow parity +
+    // the default build's --brute.  Skip for a clean release --brute.
+    std::fprintf(stderr, "testPrimIntersectAttrsMapAttrsChainCopy: SKIPPED under V3_RELEASE (instrumentation-gated)\n");
+    return 0;
+#endif
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
     const PrimOp * intersectPo = findPrimOp("intersectAttrs");
     if (!mapAttrsPo || !intersectPo) {
@@ -2346,6 +2384,13 @@ static int testPrimIntersectAttrsMapAttrsChainDiscardNoApp3()
 
 static int testPrimRemoveAttrsMapAttrsChainCopy()
 {
+#ifdef V3_RELEASE
+    // Instrumentation-gated (RR4-R3): asserts on allocStats().pairsAllocated
+    // (compiled to zero under V3_RELEASE); behavior covered by shadow parity +
+    // the default build's --brute.  Skip for a clean release --brute.
+    std::fprintf(stderr, "testPrimRemoveAttrsMapAttrsChainCopy: SKIPPED under V3_RELEASE (instrumentation-gated)\n");
+    return 0;
+#endif
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
     const PrimOp * removePo = findPrimOp("removeAttrs");
     if (!mapAttrsPo || !removePo) {

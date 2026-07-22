@@ -283,3 +283,29 @@ Infra (`~/Projects/zw3rk/infra`):
 
 Net: correctness/parity fully preserved; the new throws are exercised and
 retry-healed. Safe to publish.
+
+### Release-build re-gate (`v3_release=true`, RR4-R3 decision)
+
+The deployed evaluator is switched to the RELEASE build (package.nix
+`mesonFlags = [ (lib.mesonBool "v3_release" true) ]`) — always-on
+instrumentation stripped (V3_STATS_* → no-ops), env-gated diagnostics still
+available on demand.  V3_RELEASE is correctness-neutral (diagnostic counters
+only), re-verified:
+
+- Release build compiles clean (meson prints `v3: V3_RELEASE build`), no
+  `-Werror` from any stripped `V3_STATS_BLOCK`.
+- `--brute` clean on the release build after two follow-on fixes:
+  - 6 smoke sub-tests (`testPrim{MapAttrsNames,MapAttrsNestedNames}DoNotRealize`,
+    `testPrimAttrValuesMapAttrsSortsWithOneAppPerValue`,
+    `testPrimMapAttrsNestedSelectUsesMappedValue`,
+    `testPrim{IntersectAttrs,RemoveAttrs}MapAttrsChainCopy`) assert on
+    `allocStats().pairsAllocated` App3-memoization pair counts, which
+    V3_RELEASE zeroes; guarded `#ifdef V3_RELEASE` to SKIP (their primop
+    behavior is covered on the release binary by the shadow-parity gate and
+    fully asserted in the default build's --brute).  Default build unchanged
+    (41/41).
+  - lint-no-direct-tw-include: the round-3 explanatory comment in
+    eval_jobs_api.cc literally contained the grep pattern `#include "nix/`;
+    reworded (it also failed on the non-release committed state — fixed).
+- Shadow parity on the RELEASE lib: byte-IDENTICAL to the pristine TW oracle
+  on baseline + extended flakes; exactly 2 retries (18 + badout).
