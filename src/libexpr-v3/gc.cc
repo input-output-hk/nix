@@ -453,8 +453,23 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
     // forwardable pointer.  Cell included in the gate.
     switch (t->state) {
     case ThunkState::Blackhole:
-        if (!t->cell) return t;  // truly nothing to walk
-        break;                   // fall through to queue if cell set
+        // #705 / N1 FIX (2026-07-23): a Blackhole thunk's payload is NOT
+        // irrelevant, and the thunk itself MUST be relocated like any
+        // other:  clearBlackMarksOnException (and the
+        // NIX_V3_LEAKED_BLACK_RECOVER gate) revert Blackhole → Suspended
+        // after an exception unwind, and blackhole-as-value lets
+        // consumers read the thunk directly.  The old early-return left
+        // a reachable Blackhole thunk UNRELOCATED — every reference kept
+        // pointing into from-space, which is reset and reused after the
+        // scavenge, so a later force read NaN-boxed garbage where the
+        // thunk used to live (stale suspended.desc → SIGSEGV in
+        // forceValue; stale closure/upvalues → OP_GET_UPVALUE index out
+        // of range / "not attrsets" / mapAttrs type errors).  Reproduced
+        // deterministically on haskell.nix hydraJobs nix-tools (hydra
+        // RR1-F2 whole-eval aborts).  The AUDIT walker (below, ~:1397)
+        // already documented and honoured this exact invariant; the live
+        // scavenger now does too: fall through and queue unconditionally.
+        break;
     case ThunkState::Evaluated:
         if (isLeafTag(t->evaluated.tag()) && !t->cell) return t;
         break;
