@@ -14859,6 +14859,10 @@ Value forceValue(VMState & vm, Value v)
                 std::getenv("NIX_V3_NO_APP_MEMO") != nullptr;
             bool outerIsAppLike = v.isAppLike();
             ValuePair * outerPair = outerIsAppLike ? v.asPair() : nullptr;
+            // Rooted copy of the outer App value: the memo write at the
+            // bottom re-derives the pair from this instead of the raw
+            // outerPair, which dangles if a mid-apply scavenge relocates it.
+            Value outerVal = v;
             // Memo-hit fast path: outerPair->evaluated holds the
             // previously-resolved result.  Tag::Uninitialized (== 0)
             // is the sentinel meaning "not yet resolved".  2026-05-30:
@@ -14901,6 +14905,24 @@ Value forceValue(VMState & vm, Value v)
                 pushRight(p->right);
                 v = p->left;
             }
+            // Root the spine rights, the working leaf, and the outer App
+            // value across the re-entrant leaf force + applies below.  When
+            // forceValue is entered from C++ with vm.frames empty (the
+            // eval-jobs descendAttrPath accessor path), callClosure* runs
+            // dispatchLoop at exitDepth==0 where a minor scavenge may fire;
+            // these C-locals are invisible to the scavenger (the gc_root.hh
+            // Stage-6 caveat assumes helper C-frames are unwound before any
+            // scavenge, which is false for this driver) and dangle after
+            // relocation.  Reproduced on haskell.nix nix-tools (stale
+            // closure/thunk pushed from this buffer → upvalue-OOR /
+            // not-an-attrset / SIGSEGV in the next force).  Same idiom as the
+            // applied-cache hook's GcRoot rf/ra.
+            GcRootRange rootInline_(inlineRights,
+                                    nRights < kInlineRights ? nRights
+                                                            : kInlineRights);
+            GcRootVec rootOverflow_(overflowRights);
+            GcRoot rootLeaf_(v);
+            GcRoot rootOuter_(outerVal);
             if (v.tag() == Tag::Slot
                 || v.tag() == Tag::Thunk
                 || v.isAppLike())
@@ -14910,6 +14932,9 @@ Value forceValue(VMState & vm, Value v)
                 Value args[kInlineRights];
                 for (size_t ai = 0; ai < i; ++ai)
                     args[ai] = rightAt(i - 1 - ai);
+                // args[] is consumed across a re-entrant call that may
+                // scavenge — root it like the spine buffer above.
+                GcRootRange rootArgs_(args, i);
                 Value exactOut;
                 if (callClosureNExact(vm, v, args, static_cast<uint32_t>(i), exactOut)) {
                     v = exactOut;
@@ -14927,12 +14952,18 @@ Value forceValue(VMState & vm, Value v)
             // Memoize: store the result in the outermost App / App3
             // pair's evaluated field so the next force short-circuits.
             // Defensive: avoid writing back a non-WHNF result.
-            if (!s_noAppMemo && outerIsAppLike && outerPair) {
+            // Re-derive the pair from the ROOTED outer value: the raw
+            // outerPair captured before the applies dangles if a scavenge
+            // relocated the pair mid-apply (a barriered write into reused
+            // from-space bytes corrupts whatever lives there now).
+            if (!s_noAppMemo && outerIsAppLike && outerVal.isAppLike()) {
+                ValuePair * outerPairNow = outerVal.asPair();
                 Tag rt = v.tag();
-                if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::App3
+                if (outerPairNow
+                    && rt != Tag::Thunk && rt != Tag::App && rt != Tag::App3
                     && rt != Tag::Slot
                     && rt != Tag::Uninitialized && rt != Tag::Blackhole)
-                    pairSetEvaluated(outerPair, v);  // Phase D barrier
+                    pairSetEvaluated(outerPairNow, v);  // Phase D barrier
             }
             continue;
         }
