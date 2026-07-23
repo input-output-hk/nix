@@ -867,6 +867,33 @@ void Scavenger::run()
     for (Value & v : vm.valueStack) visitValue(v);
     for (Value & v : vm.withStack)  visitValue(v);
 
+    // Zero the DEAD RESIDUE of the stack vectors ([size, capacity)):
+    // the walk above forwards only the live [0, size) prefix, so slack
+    // slots keep pre-scavenge Values whose payloads dangle after the
+    // nursery reset.  Any later read of a dead slot (a cached stack
+    // index surviving an unwind, an off-by-one against a stale
+    // stackBase) resurrects a stale pointer that no audit can see —
+    // the slack is C++-heap memory, invisible to the arena BRUTE scan.
+    // Opt-out gate for A/B diagnosis: NIX_V3_NO_STACK_RESIDUE_ZERO=1.
+    {
+        static const bool s_noZero =
+            std::getenv("NIX_V3_NO_STACK_RESIDUE_ZERO") != nullptr;
+        if (!s_noZero) {
+            auto zeroResidue = [](auto & vs) {
+                if (vs.capacity() > vs.size())
+                    std::memset(static_cast<void *>(vs.data() + vs.size()), 0,
+                                (vs.capacity() - vs.size()) * sizeof(Value));
+            };
+            zeroResidue(vm.valueStack);
+            zeroResidue(vm.withStack);
+            for (VMState * other : activeVMStack())
+                if (other && other != &vm) {
+                    zeroResidue(other->valueStack);
+                    zeroResidue(other->withStack);
+                }
+        }
+    }
+
     // #705 (2026-05-21): walk the OTHER active VMStates first
     // (under nested runFunctionWithUpvalues / runFunction).  Their
     // frames hold nursery closure/thunk pointers that the per-vm
@@ -1216,6 +1243,20 @@ void Scavenger::run()
     for (ListVec ** slot : singletonCapturedWithsRegistry()) {
         if (slot && *slot)
             *slot = fwdList(*slot);
+    }
+
+    // Parity with the capturedWiths walk above: forward the lambda-lift
+    // singleton closures.  bytecode.hh's LambdaState doc promises "the
+    // moving GC forwards the Closure* through it", but the only walk of
+    // singletonClosureRegistry() lived in precise_root.cc — a path that
+    // is DEAD in production (major GC off under the nursery).  Today the
+    // interned closures are allocated tenured so this is a no-op guard;
+    // it makes the documented invariant actually hold if that ever
+    // changes, and closes the audit item at alloc.hh (allocClosureTenured
+    // docstring names this slot as the one scavenger-invisible Closure*).
+    for (Closure ** slot : singletonClosureRegistry()) {
+        if (slot && *slot)
+            *slot = fwdClosure(*slot);
     }
 
     // -- Stage 2: walk graylist ---------------------------------
