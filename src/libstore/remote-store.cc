@@ -820,6 +820,21 @@ void RemoteStore::shutdownConnections()
     }
 }
 
+void RemoteStore::reconnectAfterFork()
+{
+    /* Post-fork, child only.  Drop the idle daemon connections inherited
+       from the (quiescent) warm parent WITHOUT ::shutdown() — unlike
+       shutdownConnections() above, which acts on the shared socket
+       description and would break the PARENT's connection too.  Pool::clear()
+       just releases our refs; each Connection dtor's AutoCloseFD closes only
+       the child's fd copy, so the parent's file description survives.  The
+       parent forked while quiescent, so no send-buffer flush hits the wire.
+       The next getConnection() opens a brand-new socket via openConnection(). */
+    connections->clear();
+    connectionFds.lock()->clear(); // forget the parent's stale tracked fds
+    failed = false;                // atomic_bool; allow a fresh connect in the child
+}
+
 void RemoteStore::narFromPath(const StorePath & path, Sink & sink)
 {
     auto conn(getConnection());

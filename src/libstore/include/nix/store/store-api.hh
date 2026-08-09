@@ -908,6 +908,14 @@ public:
     virtual void connect() {};
 
     /**
+     * Drop fork-unsafe connection/handle state after fork() so the next
+     * operation in the CHILD opens FRESH state.  Default no-op.  MUST be
+     * called in the child right after fork(), before any store I/O.
+     * See RemoteStore::reconnectAfterFork.
+     */
+    virtual void reconnectAfterFork() {}
+
+    /**
      * Get the protocol version of this store or it's connection.
      */
     virtual unsigned int getProtocol()

@@ -150,6 +150,15 @@ struct Settings : public Config
 
     ref<Cache> getCache() const;
 
+    /**
+     * Post-fork (child only): orphan the inherited fetch-cache SQLite handle
+     * and null the memoised pointer so the next getCache() opens fresh.
+     * Deliberately does NOT sqlite3_close() the inherited handle: it is WAL,
+     * and closing a WAL connection shared across fork() can checkpoint-write
+     * the fd the parent still holds.  const: _cache is mutable.
+     */
+    void resetCacheAfterFork() const;
+
     ref<GitRepo> getTarballCache() const;
 
 private:

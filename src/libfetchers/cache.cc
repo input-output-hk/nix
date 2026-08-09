@@ -164,4 +164,19 @@ ref<Cache> Settings::getCache() const
     return ref<Cache>(*cache);
 }
 
+void Settings::resetCacheAfterFork() const
+{
+    auto cache(_cache.lock());
+    if (*cache) {
+        /* Intentionally LEAK the inherited CacheImpl: transfer the refcount
+           into a never-freed heap shared_ptr so ~CacheImpl => ~SQLite =>
+           sqlite3_close never runs on a handle shared with the parent across
+           fork() (the WAL close could checkpoint-write a fd the parent still
+           holds).  One leaked handle per worker is bounded and process-lived;
+           the next getCache() reopens fresh. */
+        new std::shared_ptr<Cache>(std::move(*cache));
+        *cache = nullptr;
+    }
+}
+
 } // namespace nix::fetchers

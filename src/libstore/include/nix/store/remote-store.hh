@@ -163,6 +163,13 @@ struct RemoteStore : public virtual Store, public virtual GcStore, public virtua
      */
     void shutdownConnections();
 
+    /**
+     * Post-fork (child only): drop the daemon connections inherited from a
+     * forked parent so the next request opens a fresh socket.  See the
+     * definition for why this must NOT use shutdownConnections().
+     */
+    void reconnectAfterFork() override;
+
     struct Connection;
 
     ref<Connection> openConnectionWrapper();
