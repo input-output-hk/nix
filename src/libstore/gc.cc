@@ -610,20 +610,63 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             if (dead.count(*path))
                 continue;
 
+            /* Mark `*path`, `start` and everything `*path` references as alive,
+               using `alive` itself as the visited set.  A path already known to
+               be alive had its own references marked when it was first reached,
+               so there is no need to descend into it again.
+
+               This used to pass a *fresh* accumulator to computeFSClosure(),
+               which made every root re-walk its entire closure from scratch.
+               Roots overwhelmingly share their lower layers (stdenv, the
+               compiler, ...), so the total cost was sum(|closure(root_i)|)
+               rather than |union of closure(root_i)|.  With ~21k roots and
+               `keep-outputs`/`keep-derivations` both on -- so the traversal also
+               follows derivation<->output edges -- that difference is minutes
+               versus days: it was observed holding the GC lock for 19.5h,
+               issuing ~7k SQLite queries/s, without freeing a single byte.
+
+               The traversal below open-codes computeFSClosure()'s
+               `flipDirection = false` edges (references, plus outputs under
+               `keep-outputs` and derivers under `keep-derivations`) because
+               `alive` is an unordered_flat_set while computeFSClosure() requires
+               a StorePathSet accumulator, and switching `alive` to std::set
+               would slow down the far more frequent alive.count() lookups.
+
+               Skipping an already-alive subgraph cannot under-protect it: any
+               path reachable from an alive path has that path among its
+               referrers, so the referrers walk above still marks it alive when
+               the store iteration reaches it. */
             auto markAlive = [&]() {
-                alive.insert(*path);
+                std::queue<StorePath> todo;
+
+                auto push = [&](const StorePath & p) {
+                    if (alive.insert(p).second)
+                        todo.push(p);
+                };
+
+                push(*path);
                 alive.insert(start);
-                try {
-                    StorePathSet closure;
-                    computeFSClosure(
-                        *path,
-                        closure,
-                        /* flipDirection */ false,
-                        keepOutputs,
-                        keepDerivations);
-                    for (auto & p : closure)
-                        alive.insert(p);
-                } catch (InvalidPath &) {
+
+                while (auto p = pop(todo)) {
+                    checkInterrupt();
+                    try {
+                        auto info = queryPathInfo(*p);
+
+                        for (auto & ref : info->references)
+                            if (ref != *p)
+                                push(ref);
+
+                        if (keepOutputs && p->isDerivation())
+                            for (auto & [_, maybeOutPath] : queryPartialDerivationOutputMap(*p))
+                                if (maybeOutPath && isValidPath(*maybeOutPath))
+                                    push(*maybeOutPath);
+
+                        if (keepDerivations && info->deriver && isValidPath(*info->deriver))
+                            push(*info->deriver);
+                    } catch (InvalidPath &) {
+                        /* Per path rather than aborting the whole walk, so one
+                           invalid entry does not stop the rest being marked. */
+                    }
                 }
             };
 
