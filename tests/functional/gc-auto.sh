@@ -205,3 +205,92 @@ wait "$staleBuildPid"
 staleBuildPid=
 
 nix-store --check-validity "$staleGarbage1" "$staleGarbage2"
+
+# Empty auto-GC results are shared between local-store processes. A new garbage
+# path must survive a second process's recent empty result, while a manual GC
+# and a full-space-band drop still collect it.
+clearStore
+nix-store --init
+emptyGCCache=$NIX_STATE_DIR/auto-gc-empty-cache.json
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+
+addCachePath() {
+    local name=$1 log=$2 maxFree=${3:-2K} pathFile=$TEST_ROOT/$1.path
+    NIX_DEBUG_AUTO_GC=1 nix \
+        --option min-free 1K \
+        --option max-free "$maxFree" \
+        --option min-free-check-interval 0 \
+        store add-path --name "$name" ./nar-access.sh >"$pathFile" 2>"$log"
+    cat "$pathFile"
+}
+
+cacheFirstLog=$TEST_ROOT/auto-gc-empty-first.log
+cacheFirst=$(addCachePath auto-gc-empty-first "$cacheFirstLog")
+grep -q 'event=completed .*bytes_freed=0 paths=0' "$cacheFirstLog" || {
+    cat "$cacheFirstLog"
+    fail "first low-space auto-GC did not complete an empty scan"
+}
+
+# This invocation is a different process. It adds a distinct, unrooted path;
+# verify that the first path survives the shared recent-empty shortcut.
+cacheSecondLog=$TEST_ROOT/auto-gc-empty-second.log
+cacheSecond=$(addCachePath auto-gc-empty-second "$cacheSecondLog")
+grep -q 'event=cache-skip skip_reason=recent-empty' "$cacheSecondLog" || {
+    cat "$cacheSecondLog"
+    fail "second local-store process did not reuse the recent empty result"
+}
+nix-store --check-validity "$cacheFirst"
+
+# Explicit GC remains authoritative even while the empty-result record is fresh.
+nix-store --gc
+if nix-store --check-validity "$cacheFirst" >/dev/null 2>&1; then
+    fail "manual GC incorrectly honored the auto-GC empty-result cache"
+fi
+
+# Equality at 97 percent is outside the cooldown band and must trigger a scan.
+cacheThresholdSeed=$(addCachePath auto-gc-empty-threshold-seed "$TEST_ROOT/auto-gc-empty-threshold-seed.log")
+echo 97 > "$fake_free"
+cacheThresholdLog=$TEST_ROOT/auto-gc-empty-threshold.log
+cacheThreshold=$(addCachePath auto-gc-empty-threshold "$cacheThresholdLog")
+grep -q 'event=completed .*paths=[1-9]' "$cacheThresholdLog" || {
+    cat "$cacheThresholdLog"
+    fail "auto-GC did not scan at exactly 97 percent of the recorded free space"
+}
+if nix-store --check-validity "$cacheThresholdSeed" >/dev/null 2>&1; then
+    fail "the 97-percent threshold scan did not collect known garbage"
+fi
+
+# A changed GC target invalidates the cache even when the free-space value is
+# inside the reuse band.
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheConfigSeed=$(addCachePath auto-gc-empty-config-seed "$TEST_ROOT/auto-gc-empty-config-seed.log")
+cacheConfigLog=$TEST_ROOT/auto-gc-empty-config.log
+cacheConfig=$(addCachePath auto-gc-empty-config-changed "$cacheConfigLog" 3K)
+grep -q 'event=completed .*paths=[1-9]' "$cacheConfigLog" || {
+    cat "$cacheConfigLog"
+    fail "changed max-free configuration reused an incompatible empty result"
+}
+if nix-store --check-validity "$cacheConfigSeed" >/dev/null 2>&1; then
+    fail "changed max-free scan did not collect known garbage"
+fi
+
+# Corrupt cache contents are treated as a miss, not as a reason to skip GC.
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheCorruptSeed=$(addCachePath auto-gc-empty-corrupt-seed "$TEST_ROOT/auto-gc-empty-corrupt-seed.log")
+echo 'not a valid cache record' > "$emptyGCCache"
+cacheCorruptLog=$TEST_ROOT/auto-gc-empty-corrupt.log
+cacheCorrupt=$(addCachePath auto-gc-empty-corrupt-trigger "$cacheCorruptLog")
+grep -q 'event=completed .*paths=[1-9]' "$cacheCorruptLog" || {
+    cat "$cacheCorruptLog"
+    fail "corrupt empty-result cache prevented a real scan"
+}
+if nix-store --check-validity "$cacheCorruptSeed" >/dev/null 2>&1; then
+    fail "cache-miss scan did not collect known garbage"
+fi

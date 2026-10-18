@@ -333,12 +333,15 @@ protected:
     /**
      * Implementation shared by explicit and automatic garbage collection.
      * The optional check runs after acquiring the global GC lock and is used
-     * only by auto-GC to discard stale requests.
+     * only by auto-GC to discard stale requests. The optional completion hook
+     * runs before releasing the global GC lock and is also used only by
+     * auto-GC.
      */
     virtual void collectGarbageImpl(
         GCOptions options,
         GCResults & results,
-        const std::function<bool(GCOptions &)> & shouldCollect);
+        const std::function<bool(GCOptions &)> & shouldCollect,
+        const std::function<void(const GCResults &)> & afterCollect);
 
 public:
 
