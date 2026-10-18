@@ -339,6 +339,7 @@ nix-store --init
 rm -f "$emptyGCCache"
 echo 100 > "$fake_free"
 cacheFifoSeed=$(addCachePath auto-gc-empty-fifo-seed "$TEST_ROOT/auto-gc-empty-fifo-seed.log")
+rm -f "$emptyGCCache"
 mkfifo "$emptyGCCache"
 cacheFifoLog=$TEST_ROOT/auto-gc-empty-fifo.log
 cacheFifoPathFile=$TEST_ROOT/auto-gc-empty-fifo.path
