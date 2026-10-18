@@ -119,6 +119,15 @@ This will:
 
 3. Stop the program when the test fails, allowing the user to then issue arbitrary commands to GDB.
 
+### Automatic garbage collection diagnostics
+
+Set `NIX_DEBUG_AUTO_GC=1` in the Nix daemon environment to write compact
+automatic garbage collection request records to standard error. Each record
+includes the process and request IDs, queue time, available space at request,
+lock acquisition and completion, and the existing GC byte and path counters.
+The post-lock duration is an upper bound through collection cleanup and the
+final free-space check. The flag is disabled by default.
+
 ### Characterisation testing { #characterisation-testing-unit }
 
 See [functional characterisation testing](#characterisation-testing-functional) for a broader discussion of characterisation testing.
