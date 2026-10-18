@@ -352,6 +352,14 @@ struct GCLimitReached
 
 void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
+    collectGarbageImpl(options, results, {});
+}
+
+void LocalStore::collectGarbageImpl(
+    GCOptions options,
+    GCResults & results,
+    const std::function<bool(GCOptions &)> & shouldCollect)
+{
     const auto & gcSettings = config->getLocalSettings().getGCSettings();
 
     bool shouldDelete = options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific;
@@ -392,6 +400,11 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        downgrade our exclusive lock. */
     auto fdGCLock = openGCLock();
     FdLock gcLock(fdGCLock.get(), ltWrite, true, "waiting for the big garbage collector lock...");
+
+    /* Auto-GC requests can queue behind another collector. Re-evaluate
+       whether collection is still needed only after acquiring this lock. */
+    if (shouldCollect && !shouldCollect(options))
+        return;
 
     /* Synchronisation point to test ENOENT handling in
        addTempRoot(), see tests/gc-non-blocking.sh. */
@@ -913,11 +926,17 @@ void LocalStore::autoGC(bool sync)
                 GCOptions options;
                 options.maxFreed = gcSettings.maxFree - avail;
 
-                printInfo("running auto-GC to free %d bytes", options.maxFreed);
-
                 GCResults results;
 
-                collectGarbage(options, results);
+                collectGarbageImpl(options, results, [&](GCOptions & options) {
+                    auto avail = getAvail();
+                    if (avail >= gcSettings.minFree || avail >= gcSettings.maxFree)
+                        return false;
+
+                    options.maxFreed = gcSettings.maxFree - avail;
+                    printInfo("running auto-GC to free %d bytes", options.maxFreed);
+                    return true;
+                });
 
                 _state->lock()->availAfterGC = getAvail();
 

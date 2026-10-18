@@ -9,6 +9,7 @@
 #include "nix/util/sync.hh"
 
 #include <chrono>
+#include <functional>
 #include <future>
 #include <string>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -326,6 +327,18 @@ private:
     void findTempRoots(Roots & roots, bool censor);
 
     AutoCloseFD openGCLock();
+
+protected:
+
+    /**
+     * Implementation shared by explicit and automatic garbage collection.
+     * The optional check runs after acquiring the global GC lock and is used
+     * only by auto-GC to discard stale requests.
+     */
+    virtual void collectGarbageImpl(
+        GCOptions options,
+        GCResults & results,
+        const std::function<bool(GCOptions &)> & shouldCollect);
 
 public:
 

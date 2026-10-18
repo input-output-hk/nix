@@ -176,9 +176,12 @@ private:
         const DrvOutput &, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override;
 
     /**
-     * Call `remountIfNecessary` after collecting garbage normally.
+     * Preserve overlay remount handling for both explicit and automatic GC.
      */
-    void collectGarbage(const GCOptions & options, GCResults & results) override;
+    void collectGarbageImpl(
+        GCOptions options,
+        GCResults & results,
+        const std::function<bool(GCOptions &)> & shouldCollect) override;
 
     /**
      * Check which layers the store object exists in to try to avoid

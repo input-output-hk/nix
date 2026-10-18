@@ -198,9 +198,12 @@ void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos)
     LocalStore::registerValidPaths(infos);
 }
 
-void LocalOverlayStore::collectGarbage(const GCOptions & options, GCResults & results)
+void LocalOverlayStore::collectGarbageImpl(
+    GCOptions options,
+    GCResults & results,
+    const std::function<bool(GCOptions &)> & shouldCollect)
 {
-    LocalStore::collectGarbage(options, results);
+    LocalStore::collectGarbageImpl(std::move(options), results, shouldCollect);
 
     remountIfNecessary();
 }
