@@ -294,3 +294,42 @@ grep -q 'event=completed .*paths=[1-9]' "$cacheCorruptLog" || {
 if nix-store --check-validity "$cacheCorruptSeed" >/dev/null 2>&1; then
     fail "cache-miss scan did not collect known garbage"
 fi
+
+# Valid JSON with the wrong numeric types/schema is also a cache miss. In
+# particular, floating-point and oversized schema values must not be coerced
+# into integers by the parser.
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheMalformedSeed=$(addCachePath auto-gc-empty-malformed-seed "$TEST_ROOT/auto-gc-empty-malformed-seed.log")
+cat > "$emptyGCCache" <<'EOF'
+{"schema":1,"completed_at":100,"free_after":100.5,"identity":"invalid"}
+EOF
+cacheMalformedLog=$TEST_ROOT/auto-gc-empty-malformed.log
+cacheMalformed=$(addCachePath auto-gc-empty-malformed-trigger "$cacheMalformedLog")
+grep -q 'event=completed .*paths=[1-9]' "$cacheMalformedLog" || {
+    cat "$cacheMalformedLog"
+    fail "valid JSON with a floating-point free_after did not trigger a scan"
+}
+if nix-store --check-validity "$cacheMalformedSeed" >/dev/null 2>&1; then
+    fail "floating-point cache miss did not collect known garbage"
+fi
+
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheSchemaSeed=$(addCachePath auto-gc-empty-schema-seed "$TEST_ROOT/auto-gc-empty-schema-seed.log")
+cat > "$emptyGCCache" <<'EOF'
+{"schema":4294967297,"completed_at":100,"free_after":100,"identity":"invalid"}
+EOF
+cacheSchemaLog=$TEST_ROOT/auto-gc-empty-schema.log
+cacheSchema=$(addCachePath auto-gc-empty-schema-trigger "$cacheSchemaLog")
+grep -q 'event=completed .*paths=[1-9]' "$cacheSchemaLog" || {
+    cat "$cacheSchemaLog"
+    fail "unknown oversized cache schema did not trigger a scan"
+}
+if nix-store --check-validity "$cacheSchemaSeed" >/dev/null 2>&1; then
+    fail "unknown-schema cache miss did not collect known garbage"
+fi

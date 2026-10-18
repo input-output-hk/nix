@@ -23,6 +23,7 @@
 #include <thread>
 #include <atomic>
 #include <optional>
+#include <limits>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -60,6 +61,7 @@ static std::optional<std::string> autoGCCacheIdentity(
            represented by the shared local-store fields. Do not share their cache. */
         if (storeReference != "local" && storeReference != "local://")
             return std::nullopt;
+        storeReference = "local";
 
         return nlohmann::json{
             {"schema", 1},
@@ -86,16 +88,59 @@ static int64_t wallClockSeconds()
 static AutoGCCacheRead readAutoGCCache(const std::filesystem::path & path) noexcept
 {
     try {
-        auto json = nlohmann::json::parse(readFile(path));
-        if (!json.is_object() || json.value("schema", 0) != 1 || !json.contains("completed_at")
+        auto fd = openFileReadonly(path);
+        if (!fd)
+            return {.record = std::nullopt, .reason = "cache-invalid"};
+
+        struct stat st;
+        if (fstat(fd.get(), &st) == -1 || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 64 * 1024)
+            return {.record = std::nullopt, .reason = "cache-invalid"};
+
+        auto json = nlohmann::json::parse(readFile(fd.get()));
+        if (!json.is_object() || !json.contains("schema") || !json.at("schema").is_number_integer()
+            || !json.contains("completed_at")
             || !json.contains("free_after") || !json.contains("identity"))
             return {.record = std::nullopt, .reason = "cache-invalid"};
 
+        const auto & schema = json.at("schema");
+        if ((schema.is_number_unsigned() && schema.get<nlohmann::json::number_unsigned_t>() != 1)
+            || (schema.is_number_integer() && !schema.is_number_unsigned()
+                && schema.get<nlohmann::json::number_integer_t>() != 1))
+            return {.record = std::nullopt, .reason = "cache-invalid"};
+
+        const auto & completedAt = json.at("completed_at");
+        const auto & freeAfter = json.at("free_after");
+        const auto & identity = json.at("identity");
+        if (!completedAt.is_number_integer() || !freeAfter.is_number_integer() || !identity.is_string())
+            return {.record = std::nullopt, .reason = "cache-invalid"};
+
+        int64_t completedAtValue;
+        if (completedAt.is_number_unsigned()) {
+            auto value = completedAt.get<nlohmann::json::number_unsigned_t>();
+            if (value > static_cast<nlohmann::json::number_unsigned_t>(std::numeric_limits<int64_t>::max()))
+                return {.record = std::nullopt, .reason = "cache-invalid"};
+            completedAtValue = static_cast<int64_t>(value);
+        } else {
+            completedAtValue = completedAt.get<nlohmann::json::number_integer_t>();
+            if (completedAtValue < 0)
+                return {.record = std::nullopt, .reason = "cache-invalid"};
+        }
+
+        uint64_t freeAfterValue;
+        if (freeAfter.is_number_unsigned()) {
+            freeAfterValue = freeAfter.get<nlohmann::json::number_unsigned_t>();
+        } else {
+            auto value = freeAfter.get<nlohmann::json::number_integer_t>();
+            if (value < 0)
+                return {.record = std::nullopt, .reason = "cache-invalid"};
+            freeAfterValue = static_cast<uint64_t>(value);
+        }
+
         return {
             .record = detail::EmptyAutoGCCacheRecord{
-                .completedAt = json.at("completed_at").get<int64_t>(),
-                .freeAfter = json.at("free_after").get<uint64_t>(),
-                .identity = json.at("identity").get<std::string>(),
+                .completedAt = completedAtValue,
+                .freeAfter = freeAfterValue,
+                .identity = identity.get<std::string>(),
             },
             .reason = "cache-loaded",
         };
@@ -133,8 +178,7 @@ static bool writeAutoGCCache(
         }
                              .dump();
         writeFull(fd.get(), contents, /*allowInterrupts=*/true);
-        if (fsync(fd.get()) == -1)
-            throw SysError("syncing automatic GC cache");
+        fd.fsync();
         fd.close();
         std::filesystem::rename(temporary, path);
         return true;
@@ -1012,18 +1056,6 @@ void LocalStore::autoGC(bool sync)
 
     const auto & gcSettings = config->getLocalSettings().getGCSettings();
 
-    std::optional<std::string> cacheIdentity;
-    std::optional<std::filesystem::path> cachePath;
-    try {
-        cacheIdentity = autoGCCacheIdentity(*config, gcSettings);
-        if (cacheIdentity)
-            cachePath = config->stateDir.get() / std::string{autoGCCacheFile};
-    } catch (...) {
-        // The cache is only an optimization; identity failures disable it.
-        cacheIdentity.reset();
-        cachePath.reset();
-    }
-
     static auto fakeFreeSpaceFile = getEnv("_NIX_TEST_FREE_SPACE_FILE");
 
     auto getAvail = [this]() -> uint64_t {
@@ -1068,7 +1100,7 @@ void LocalStore::autoGC(bool sync)
         std::promise<void> promise;
         future = state->gcFuture = promise.get_future().share();
 
-        std::thread([promise{std::move(promise)}, this, avail, getAvail, &gcSettings, cacheIdentity, cachePath, diagnosticEnabled,
+        std::thread([promise{std::move(promise)}, this, avail, getAvail, &gcSettings, diagnosticEnabled,
                         requestStarted, elapsedMs, logDiagnostic]() mutable {
             auto queuedAt = diagnosticEnabled ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
@@ -1078,6 +1110,8 @@ void LocalStore::autoGC(bool sync)
             std::string_view skipReason = "none";
             std::optional<uint64_t> cacheAge;
             std::optional<uint64_t> cacheFreeAfter;
+            std::optional<std::string> cacheIdentity;
+            std::optional<std::filesystem::path> cachePath;
             GCResults results;
             try {
 
@@ -1114,6 +1148,16 @@ void LocalStore::autoGC(bool sync)
                     if (avail >= gcSettings.minFree || avail >= gcSettings.maxFree) {
                         skipReason = "space-restored";
                         return false;
+                    }
+
+                    try {
+                        cacheIdentity = autoGCCacheIdentity(*config, gcSettings);
+                        if (cacheIdentity)
+                            cachePath = config->stateDir.get() / std::string{autoGCCacheFile};
+                    } catch (...) {
+                        // The cache is only an optimization; identity failures disable it.
+                        cacheIdentity.reset();
+                        cachePath.reset();
                     }
 
                     if (cacheIdentity && cachePath) {
