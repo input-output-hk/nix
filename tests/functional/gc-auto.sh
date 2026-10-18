@@ -331,3 +331,29 @@ grep -q 'event=completed .*paths=[1-9]' "$cacheSchemaLog" || {
 if nix-store --check-validity "$cacheSchemaSeed" >/dev/null 2>&1; then
     fail "unknown-schema cache miss did not collect known garbage"
 fi
+
+# A stable FIFO at the cache path is rejected before opening it. Bound the
+# request so a regression cannot block this functional test indefinitely.
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheFifoSeed=$(addCachePath auto-gc-empty-fifo-seed "$TEST_ROOT/auto-gc-empty-fifo-seed.log")
+mkfifo "$emptyGCCache"
+cacheFifoLog=$TEST_ROOT/auto-gc-empty-fifo.log
+cacheFifoPathFile=$TEST_ROOT/auto-gc-empty-fifo.path
+if ! timeout 30s env NIX_DEBUG_AUTO_GC=1 nix \
+    --option min-free 1K \
+    --option max-free 2K \
+    --option min-free-check-interval 0 \
+    store add-path --name auto-gc-empty-fifo-trigger ./nar-access.sh >"$cacheFifoPathFile" 2>"$cacheFifoLog"; then
+    cat "$cacheFifoLog"
+    fail "FIFO at the empty-result cache path blocked auto-GC"
+fi
+grep -q 'event=completed .*paths=[1-9]' "$cacheFifoLog" || {
+    cat "$cacheFifoLog"
+    fail "FIFO cache miss did not trigger a real scan"
+}
+if nix-store --check-validity "$cacheFifoSeed" >/dev/null 2>&1; then
+    fail "FIFO cache miss did not collect known garbage"
+fi
