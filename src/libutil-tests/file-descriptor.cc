@@ -8,8 +8,12 @@
 #include <cstring>
 
 #ifndef _WIN32
+#  include <cerrno>
 #  include <fcntl.h>
 #  include <stdlib.h>
+#  include <sys/resource.h>
+#  include <sys/select.h>
+#  include <unistd.h>
 #endif
 
 namespace nix {
@@ -120,6 +124,76 @@ TEST(ReadLine, LineWithNullBytes)
 }
 
 #ifndef _WIN32
+TEST(FdSourceHasData, SupportsDescriptorsAboveFdSetSize)
+{
+    struct RestoreLimit
+    {
+        struct rlimit value;
+        bool active = false;
+
+        ~RestoreLimit()
+        {
+            if (active)
+                (void) setrlimit(RLIMIT_NOFILE, &value);
+        }
+    } restoreLimit;
+
+    ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &restoreLimit.value), 0);
+    if (restoreLimit.value.rlim_cur <= FD_SETSIZE) {
+        if (restoreLimit.value.rlim_max <= FD_SETSIZE)
+            GTEST_SKIP() << "hard RLIMIT_NOFILE is too low for an FD_SETSIZE regression";
+
+        auto raisedLimit = restoreLimit.value;
+        raisedLimit.rlim_cur = FD_SETSIZE + 1;
+        ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &raisedLimit), 0);
+        restoreLimit.active = true;
+    }
+
+    Pipe pipe;
+    pipe.create();
+
+    auto highFd = fcntl(pipe.readSide.get(), F_DUPFD, FD_SETSIZE);
+    ASSERT_NE(highFd, -1);
+    AutoCloseFD highReadSide(highFd);
+
+    FdSource source(highReadSide.get());
+    EXPECT_FALSE(source.hasData());
+
+    writeFull(pipe.writeSide.get(), "first\nsecond\n", /*allowInterrupts=*/false);
+    pipe.writeSide.close();
+
+    EXPECT_TRUE(source.hasData());
+    EXPECT_EQ(source.readLine(), "first");
+    EXPECT_TRUE(source.hasData()); // The second line is already buffered.
+    EXPECT_EQ(source.readLine(), "second");
+    EXPECT_TRUE(source.hasData()); // EOF is readable after the writer closes.
+    EXPECT_EQ(source.readLine(/*eofOk=*/true), "");
+}
+
+TEST(FdSourceHasData, ReportsBadDescriptor)
+{
+    FdSource negativeSource(-1);
+    try {
+        negativeSource.hasData();
+        FAIL() << "expected polling a negative descriptor to fail";
+    } catch (const SysError & error) {
+        EXPECT_EQ(error.errNo, EBADF);
+    }
+
+    Pipe pipe;
+    pipe.create();
+
+    FdSource source(pipe.readSide.get());
+    pipe.readSide.close();
+
+    try {
+        source.hasData();
+        FAIL() << "expected polling a closed descriptor to fail";
+    } catch (const SysError & error) {
+        EXPECT_EQ(error.errNo, EBADF);
+    }
+}
+
 TEST(ReadLine, TreatsEioAsEof)
 {
     // Open a pty master. When the slave side is closed (or never opened),

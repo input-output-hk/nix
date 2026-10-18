@@ -209,6 +209,7 @@ bool FdSource::hasData()
     if (BufferedSource::hasData())
         return true;
 
+#ifdef _WIN32
     while (true) {
         fd_set fds;
         FD_ZERO(&fds);
@@ -227,6 +228,27 @@ bool FdSource::hasData()
         }
         return FD_ISSET(sock, &fds);
     }
+#else
+    if (fd < 0)
+        throw SysError(EBADF, "polling file descriptor");
+
+    while (true) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        auto n = poll(&pfd, 1, 0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            throw SysError("polling file descriptor");
+        }
+        if (pfd.revents & POLLNVAL)
+            throw SysError(EBADF, "polling file descriptor");
+        return pfd.revents & (POLLIN | POLLHUP | POLLERR);
+    }
+#endif
 }
 
 void FdSource::restart()
