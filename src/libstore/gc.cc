@@ -88,12 +88,12 @@ static int64_t wallClockSeconds()
 static AutoGCCacheRead readAutoGCCache(const std::filesystem::path & path) noexcept
 {
     try {
-        auto fd = openFileReadonly(path);
-        if (!fd)
+        auto pathStat = lstat(path);
+        if (!S_ISREG(pathStat.st_mode) || pathStat.st_size < 0 || pathStat.st_size > 64 * 1024)
             return {.record = std::nullopt, .reason = "cache-invalid"};
 
-        struct stat st;
-        if (fstat(fd.get(), &st) == -1 || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 64 * 1024)
+        auto fd = openFileReadonly(path);
+        if (!fd)
             return {.record = std::nullopt, .reason = "cache-invalid"};
 
         auto json = nlohmann::json::parse(readFile(fd.get()));
@@ -162,11 +162,7 @@ static bool writeAutoGCCache(
     std::filesystem::path temporary;
     try {
         temporary = makeTempPath(path.parent_path(), "auto-gc-empty");
-        auto fd = toDescriptor(open(temporary.string().c_str(), O_WRONLY | O_CREAT | O_EXCL
-#ifndef _WIN32
-                                        | O_CLOEXEC
-#endif
-                                    , 0600));
+        auto fd = openNewFileForWrite(temporary, 0600, {});
         if (!fd)
             return false;
 

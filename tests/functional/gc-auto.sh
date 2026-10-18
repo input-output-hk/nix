@@ -303,9 +303,8 @@ nix-store --init
 rm -f "$emptyGCCache"
 echo 100 > "$fake_free"
 cacheMalformedSeed=$(addCachePath auto-gc-empty-malformed-seed "$TEST_ROOT/auto-gc-empty-malformed-seed.log")
-cat > "$emptyGCCache" <<'EOF'
-{"schema":1,"completed_at":100,"free_after":100.5,"identity":"invalid"}
-EOF
+jq '.free_after = 100.5' "$emptyGCCache" > "$TEST_ROOT/auto-gc-empty-malformed-cache.json"
+mv "$TEST_ROOT/auto-gc-empty-malformed-cache.json" "$emptyGCCache"
 cacheMalformedLog=$TEST_ROOT/auto-gc-empty-malformed.log
 cacheMalformed=$(addCachePath auto-gc-empty-malformed-trigger "$cacheMalformedLog")
 grep -q 'event=completed .*paths=[1-9]' "$cacheMalformedLog" || {
@@ -321,9 +320,8 @@ nix-store --init
 rm -f "$emptyGCCache"
 echo 100 > "$fake_free"
 cacheSchemaSeed=$(addCachePath auto-gc-empty-schema-seed "$TEST_ROOT/auto-gc-empty-schema-seed.log")
-cat > "$emptyGCCache" <<'EOF'
-{"schema":4294967297,"completed_at":100,"free_after":100,"identity":"invalid"}
-EOF
+jq '.schema = 4294967297' "$emptyGCCache" > "$TEST_ROOT/auto-gc-empty-schema-cache.json"
+mv "$TEST_ROOT/auto-gc-empty-schema-cache.json" "$emptyGCCache"
 cacheSchemaLog=$TEST_ROOT/auto-gc-empty-schema.log
 cacheSchema=$(addCachePath auto-gc-empty-schema-trigger "$cacheSchemaLog")
 grep -q 'event=completed .*paths=[1-9]' "$cacheSchemaLog" || {
