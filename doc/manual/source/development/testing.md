@@ -126,7 +126,14 @@ automatic garbage collection request records to standard error. Each record
 includes the process and request IDs, queue time, available space at request,
 lock acquisition and completion, and the existing GC byte and path counters.
 The post-lock duration is an upper bound through collection cleanup and the
-final free-space check. The flag is disabled by default.
+final free-space check. It also reports when auto-GC reuses a recent empty
+scan. Plain local stores keep this private, versioned result in
+`<state-dir>/auto-gc-empty-cache.json`; it is read and replaced only while
+holding the global GC lock. A result is reusable for less than 60 seconds and
+only while free space remains above 97 percent of the recorded value. A
+configuration change, unreadable or malformed file, clock moving backwards,
+or lower free-space level causes a fresh scan. Manual GC does not use the
+cached result. The diagnostics flag is disabled by default.
 
 ### Characterisation testing { #characterisation-testing-unit }
 

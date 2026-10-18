@@ -41,6 +41,7 @@ mkMesonExecutable (finalAttrs: {
     ./meson.options
     (fileset.fileFilter (file: file.hasExt "cc") ./.)
     (fileset.fileFilter (file: file.hasExt "hh") ./.)
+    ../../src/libstore/auto-gc-cache.hh
   ];
 
   buildInputs = [

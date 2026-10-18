@@ -181,7 +181,8 @@ private:
     void collectGarbageImpl(
         GCOptions options,
         GCResults & results,
-        const std::function<bool(GCOptions &)> & shouldCollect) override;
+        const std::function<bool(GCOptions &)> & shouldCollect,
+        const std::function<void(const GCResults &)> & afterCollect) override;
 
     /**
      * Check which layers the store object exists in to try to avoid

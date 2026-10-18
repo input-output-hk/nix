@@ -205,3 +205,156 @@ wait "$staleBuildPid"
 staleBuildPid=
 
 nix-store --check-validity "$staleGarbage1" "$staleGarbage2"
+
+# Empty auto-GC results are shared between local-store processes. A new garbage
+# path must survive a second process's recent empty result, while a manual GC
+# and a full-space-band drop still collect it.
+clearStore
+nix-store --init
+emptyGCCache=$NIX_STATE_DIR/auto-gc-empty-cache.json
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+
+addCachePath() {
+    local name=$1 log=$2 maxFree=${3:-2K} pathFile=$TEST_ROOT/$1.path
+    NIX_DEBUG_AUTO_GC=1 nix \
+        --option min-free 1K \
+        --option max-free "$maxFree" \
+        --option min-free-check-interval 0 \
+        store add-path --name "$name" ./nar-access.sh >"$pathFile" 2>"$log"
+    cat "$pathFile"
+}
+
+cacheFirstLog=$TEST_ROOT/auto-gc-empty-first.log
+cacheFirst=$(addCachePath auto-gc-empty-first "$cacheFirstLog")
+grep -q 'event=completed .*bytes_freed=0 paths=0' "$cacheFirstLog" || {
+    cat "$cacheFirstLog"
+    fail "first low-space auto-GC did not complete an empty scan"
+}
+
+# This invocation is a different process. It adds a distinct, unrooted path;
+# verify that the first path survives the shared recent-empty shortcut.
+cacheSecondLog=$TEST_ROOT/auto-gc-empty-second.log
+cacheSecond=$(addCachePath auto-gc-empty-second "$cacheSecondLog")
+grep -q 'event=cache-skip skip_reason=recent-empty' "$cacheSecondLog" || {
+    cat "$cacheSecondLog"
+    fail "second local-store process did not reuse the recent empty result"
+}
+nix-store --check-validity "$cacheFirst"
+
+# Explicit GC remains authoritative even while the empty-result record is fresh.
+nix-store --gc
+if nix-store --check-validity "$cacheFirst" >/dev/null 2>&1; then
+    fail "manual GC incorrectly honored the auto-GC empty-result cache"
+fi
+
+# Equality at 97 percent is outside the cooldown band and must trigger a scan.
+cacheThresholdSeed=$(addCachePath auto-gc-empty-threshold-seed "$TEST_ROOT/auto-gc-empty-threshold-seed.log")
+echo 97 > "$fake_free"
+cacheThresholdLog=$TEST_ROOT/auto-gc-empty-threshold.log
+cacheThreshold=$(addCachePath auto-gc-empty-threshold "$cacheThresholdLog")
+grep -q 'event=completed .*paths=[1-9]' "$cacheThresholdLog" || {
+    cat "$cacheThresholdLog"
+    fail "auto-GC did not scan at exactly 97 percent of the recorded free space"
+}
+if nix-store --check-validity "$cacheThresholdSeed" >/dev/null 2>&1; then
+    fail "the 97-percent threshold scan did not collect known garbage"
+fi
+
+# A changed GC target invalidates the cache even when the free-space value is
+# inside the reuse band.
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheConfigSeed=$(addCachePath auto-gc-empty-config-seed "$TEST_ROOT/auto-gc-empty-config-seed.log")
+cacheConfigLog=$TEST_ROOT/auto-gc-empty-config.log
+cacheConfig=$(addCachePath auto-gc-empty-config-changed "$cacheConfigLog" 3K)
+grep -q 'event=completed .*paths=[1-9]' "$cacheConfigLog" || {
+    cat "$cacheConfigLog"
+    fail "changed max-free configuration reused an incompatible empty result"
+}
+if nix-store --check-validity "$cacheConfigSeed" >/dev/null 2>&1; then
+    fail "changed max-free scan did not collect known garbage"
+fi
+
+# Corrupt cache contents are treated as a miss, not as a reason to skip GC.
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheCorruptSeed=$(addCachePath auto-gc-empty-corrupt-seed "$TEST_ROOT/auto-gc-empty-corrupt-seed.log")
+echo 'not a valid cache record' > "$emptyGCCache"
+cacheCorruptLog=$TEST_ROOT/auto-gc-empty-corrupt.log
+cacheCorrupt=$(addCachePath auto-gc-empty-corrupt-trigger "$cacheCorruptLog")
+grep -q 'event=completed .*paths=[1-9]' "$cacheCorruptLog" || {
+    cat "$cacheCorruptLog"
+    fail "corrupt empty-result cache prevented a real scan"
+}
+if nix-store --check-validity "$cacheCorruptSeed" >/dev/null 2>&1; then
+    fail "cache-miss scan did not collect known garbage"
+fi
+
+# Valid JSON with the wrong numeric types/schema is also a cache miss. In
+# particular, floating-point and oversized schema values must not be coerced
+# into integers by the parser.
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheMalformedSeed=$(addCachePath auto-gc-empty-malformed-seed "$TEST_ROOT/auto-gc-empty-malformed-seed.log")
+jq '.free_after = 100.5' "$emptyGCCache" > "$TEST_ROOT/auto-gc-empty-malformed-cache.json"
+mv "$TEST_ROOT/auto-gc-empty-malformed-cache.json" "$emptyGCCache"
+cacheMalformedLog=$TEST_ROOT/auto-gc-empty-malformed.log
+cacheMalformed=$(addCachePath auto-gc-empty-malformed-trigger "$cacheMalformedLog")
+grep -q 'event=completed .*paths=[1-9]' "$cacheMalformedLog" || {
+    cat "$cacheMalformedLog"
+    fail "valid JSON with a floating-point free_after did not trigger a scan"
+}
+if nix-store --check-validity "$cacheMalformedSeed" >/dev/null 2>&1; then
+    fail "floating-point cache miss did not collect known garbage"
+fi
+
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheSchemaSeed=$(addCachePath auto-gc-empty-schema-seed "$TEST_ROOT/auto-gc-empty-schema-seed.log")
+jq '.schema = 4294967297' "$emptyGCCache" > "$TEST_ROOT/auto-gc-empty-schema-cache.json"
+mv "$TEST_ROOT/auto-gc-empty-schema-cache.json" "$emptyGCCache"
+cacheSchemaLog=$TEST_ROOT/auto-gc-empty-schema.log
+cacheSchema=$(addCachePath auto-gc-empty-schema-trigger "$cacheSchemaLog")
+grep -q 'event=completed .*paths=[1-9]' "$cacheSchemaLog" || {
+    cat "$cacheSchemaLog"
+    fail "unknown oversized cache schema did not trigger a scan"
+}
+if nix-store --check-validity "$cacheSchemaSeed" >/dev/null 2>&1; then
+    fail "unknown-schema cache miss did not collect known garbage"
+fi
+
+# A stable FIFO at the cache path is rejected before opening it. Bound the
+# request so a regression cannot block this functional test indefinitely.
+clearStore
+nix-store --init
+rm -f "$emptyGCCache"
+echo 100 > "$fake_free"
+cacheFifoSeed=$(addCachePath auto-gc-empty-fifo-seed "$TEST_ROOT/auto-gc-empty-fifo-seed.log")
+rm -f "$emptyGCCache"
+mkfifo "$emptyGCCache"
+cacheFifoLog=$TEST_ROOT/auto-gc-empty-fifo.log
+cacheFifoPathFile=$TEST_ROOT/auto-gc-empty-fifo.path
+if ! timeout 30s env NIX_DEBUG_AUTO_GC=1 nix \
+    --option min-free 1K \
+    --option max-free 2K \
+    --option min-free-check-interval 0 \
+    store add-path --name auto-gc-empty-fifo-trigger ./nar-access.sh >"$cacheFifoPathFile" 2>"$cacheFifoLog"; then
+    cat "$cacheFifoLog"
+    fail "FIFO at the empty-result cache path blocked auto-GC"
+fi
+grep -q 'event=completed .*paths=[1-9]' "$cacheFifoLog" || {
+    cat "$cacheFifoLog"
+    fail "FIFO cache miss did not trigger a real scan"
+}
+if nix-store --check-validity "$cacheFifoSeed" >/dev/null 2>&1; then
+    fail "FIFO cache miss did not collect known garbage"
+fi

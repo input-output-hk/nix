@@ -12,6 +12,7 @@
 #include "nix/util/logging.hh"
 #include "nix/util/file-system.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
+#include "auto-gc-cache.hh"
 
 #include "store-config-private.hh"
 
@@ -22,6 +23,7 @@
 #include <thread>
 #include <atomic>
 #include <optional>
+#include <limits>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -35,11 +37,153 @@
 #endif
 #include <sys/types.h>
 #include <unistd.h>
+#include <nlohmann/json.hpp>
 
 namespace nix {
 
 static std::string gcSocketPath = "gc-socket/socket";
 static std::string gcRootsDir = "gcroots";
+static constexpr std::string_view autoGCCacheFile = "auto-gc-empty-cache.json";
+
+struct AutoGCCacheRead
+{
+    std::optional<detail::EmptyAutoGCCacheRecord> record;
+    std::string_view reason;
+};
+
+static std::optional<std::string> autoGCCacheIdentity(
+    const LocalStoreConfig & config,
+    const GCSettings & settings)
+{
+    try {
+        auto storeReference = config.getReference().render(false);
+        /* Overlay stores have additional lower/upper-layer semantics that are not
+           represented by the shared local-store fields. Do not share their cache. */
+        if (storeReference != "local" && storeReference != "local://")
+            return std::nullopt;
+        storeReference = "local";
+
+        return nlohmann::json{
+            {"schema", 1},
+            {"store_type", storeReference},
+            {"state_dir", config.stateDir.get().string()},
+            {"store_dir", config.storeDir},
+            {"real_store_dir", config.realStoreDir.get().string()},
+            {"min_free", settings.minFree.get()},
+            {"max_free", settings.maxFree.get()},
+            {"keep_outputs", settings.keepOutputs.get()},
+            {"keep_derivations", settings.keepDerivations.get()},
+        }
+            .dump();
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+static int64_t wallClockSeconds()
+{
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static AutoGCCacheRead readAutoGCCache(const std::filesystem::path & path) noexcept
+{
+    try {
+        auto pathStat = lstat(path);
+        if (!S_ISREG(pathStat.st_mode) || pathStat.st_size < 0 || pathStat.st_size > 64 * 1024)
+            return {.record = std::nullopt, .reason = "cache-invalid"};
+
+        auto fd = openFileReadonly(path);
+        if (!fd)
+            return {.record = std::nullopt, .reason = "cache-invalid"};
+
+        auto json = nlohmann::json::parse(readFile(fd.get()));
+        if (!json.is_object() || !json.contains("schema") || !json.at("schema").is_number_integer()
+            || !json.contains("completed_at")
+            || !json.contains("free_after") || !json.contains("identity"))
+            return {.record = std::nullopt, .reason = "cache-invalid"};
+
+        const auto & schema = json.at("schema");
+        if ((schema.is_number_unsigned() && schema.get<nlohmann::json::number_unsigned_t>() != 1)
+            || (schema.is_number_integer() && !schema.is_number_unsigned()
+                && schema.get<nlohmann::json::number_integer_t>() != 1))
+            return {.record = std::nullopt, .reason = "cache-invalid"};
+
+        const auto & completedAt = json.at("completed_at");
+        const auto & freeAfter = json.at("free_after");
+        const auto & identity = json.at("identity");
+        if (!completedAt.is_number_integer() || !freeAfter.is_number_integer() || !identity.is_string())
+            return {.record = std::nullopt, .reason = "cache-invalid"};
+
+        int64_t completedAtValue;
+        if (completedAt.is_number_unsigned()) {
+            auto value = completedAt.get<nlohmann::json::number_unsigned_t>();
+            if (value > static_cast<nlohmann::json::number_unsigned_t>(std::numeric_limits<int64_t>::max()))
+                return {.record = std::nullopt, .reason = "cache-invalid"};
+            completedAtValue = static_cast<int64_t>(value);
+        } else {
+            completedAtValue = completedAt.get<nlohmann::json::number_integer_t>();
+            if (completedAtValue < 0)
+                return {.record = std::nullopt, .reason = "cache-invalid"};
+        }
+
+        uint64_t freeAfterValue;
+        if (freeAfter.is_number_unsigned()) {
+            freeAfterValue = freeAfter.get<nlohmann::json::number_unsigned_t>();
+        } else {
+            auto value = freeAfter.get<nlohmann::json::number_integer_t>();
+            if (value < 0)
+                return {.record = std::nullopt, .reason = "cache-invalid"};
+            freeAfterValue = static_cast<uint64_t>(value);
+        }
+
+        return {
+            .record = detail::EmptyAutoGCCacheRecord{
+                .completedAt = completedAtValue,
+                .freeAfter = freeAfterValue,
+                .identity = identity.get<std::string>(),
+            },
+            .reason = "cache-loaded",
+        };
+    } catch (...) {
+        return {.record = std::nullopt, .reason = "cache-unavailable"};
+    }
+}
+
+static void removeAutoGCCache(const std::filesystem::path & path) noexcept
+{
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+static bool writeAutoGCCache(
+    const std::filesystem::path & path,
+    const detail::EmptyAutoGCCacheRecord & record) noexcept
+{
+    std::filesystem::path temporary;
+    try {
+        temporary = makeTempPath(path.parent_path(), "auto-gc-empty");
+        auto fd = openNewFileForWrite(temporary, 0600, {});
+        if (!fd)
+            return false;
+
+        auto contents = nlohmann::json{
+            {"schema", 1},
+            {"completed_at", record.completedAt},
+            {"free_after", record.freeAfter},
+            {"identity", record.identity},
+        }
+                             .dump();
+        writeFull(fd.get(), contents, /*allowInterrupts=*/true);
+        fd.fsync();
+        fd.close();
+        std::filesystem::rename(temporary, path);
+        return true;
+    } catch (...) {
+        if (!temporary.empty())
+            removeAutoGCCache(temporary);
+        return false;
+    }
+}
 
 static void logAutoGCDiagnostic(bool enabled, uint64_t requestId, std::string_view event, std::string fields = {}) noexcept
 {
@@ -368,13 +512,14 @@ struct GCLimitReached
 
 void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
-    collectGarbageImpl(options, results, {});
+    collectGarbageImpl(options, results, {}, {});
 }
 
 void LocalStore::collectGarbageImpl(
     GCOptions options,
     GCResults & results,
-    const std::function<bool(GCOptions &)> & shouldCollect)
+    const std::function<bool(GCOptions &)> & shouldCollect,
+    const std::function<void(const GCResults &)> & afterCollect)
 {
     const auto & gcSettings = config->getLocalSettings().getGCSettings();
 
@@ -877,6 +1022,10 @@ void LocalStore::collectGarbageImpl(
 
     /* While we're at it, vacuum the database. */
     // if (options.action == GCOptions::gcDeleteDead) vacuumDB();
+
+    /* Run auto-GC bookkeeping before releasing the global GC lock. */
+    if (afterCollect)
+        afterCollect(results);
 }
 
 void LocalStore::autoGC(bool sync)
@@ -954,6 +1103,11 @@ void LocalStore::autoGC(bool sync)
             std::optional<std::chrono::steady_clock::time_point> lockAcquiredAt;
             std::optional<uint64_t> freeAtLock;
             bool lockWasAcquired = false;
+            std::string_view skipReason = "none";
+            std::optional<uint64_t> cacheAge;
+            std::optional<uint64_t> cacheFreeAfter;
+            std::optional<std::string> cacheIdentity;
+            std::optional<std::filesystem::path> cachePath;
             GCResults results;
             try {
 
@@ -974,9 +1128,8 @@ void LocalStore::autoGC(bool sync)
                         return "free_at_request=" + std::to_string(avail)
                             + " request_ms=" + std::to_string(elapsedMs(requestStarted, queuedAt));
                     });
-                bool shouldCollect = false;
-
-                collectGarbageImpl(options, results, [&](GCOptions & options) {
+                bool didCollect = false;
+                auto shouldCollect = [&](GCOptions & options) {
                     lockWasAcquired = true;
                     if (diagnosticEnabled)
                         lockAcquiredAt = std::chrono::steady_clock::now();
@@ -988,20 +1141,79 @@ void LocalStore::autoGC(bool sync)
                             return "queue_ms=" + std::to_string(elapsedMs(queuedAt, *lockAcquiredAt))
                                 + " free_at_lock=" + std::to_string(avail);
                         });
-                    if (avail >= gcSettings.minFree || avail >= gcSettings.maxFree)
+                    if (avail >= gcSettings.minFree || avail >= gcSettings.maxFree) {
+                        skipReason = "space-restored";
                         return false;
+                    }
+
+                    try {
+                        cacheIdentity = autoGCCacheIdentity(*config, gcSettings);
+                        if (cacheIdentity)
+                            cachePath = config->stateDir.get() / std::string{autoGCCacheFile};
+                    } catch (...) {
+                        // The cache is only an optimization; identity failures disable it.
+                        cacheIdentity.reset();
+                        cachePath.reset();
+                    }
+
+                    if (cacheIdentity && cachePath) {
+                        auto cache = readAutoGCCache(*cachePath);
+                        if (cache.record) {
+                            auto decision = detail::canReuseEmptyAutoGC(
+                                *cache.record, wallClockSeconds(), avail, *cacheIdentity);
+                            if (decision.reusable) {
+                                skipReason = decision.reason;
+                                cacheAge = decision.ageSeconds;
+                                cacheFreeAfter = cache.record->freeAfter;
+                                logDiagnostic("cache-skip", [&] {
+                                    return "skip_reason=recent-empty cache_age_s=" + std::to_string(decision.ageSeconds)
+                                        + " cache_free_after=" + std::to_string(cache.record->freeAfter)
+                                        + " free_at_lock=" + std::to_string(avail);
+                                });
+                                return false;
+                            }
+                            skipReason = decision.reason;
+                        } else {
+                            skipReason = cache.reason;
+                        }
+                        /* A scan supersedes any older cached result. */
+                        removeAutoGCCache(*cachePath);
+                    } else {
+                        skipReason = "unsupported-store";
+                    }
 
                     options.maxFreed = gcSettings.maxFree - avail;
-                    shouldCollect = true;
+                    didCollect = true;
                     printInfo("running auto-GC to free %d bytes", options.maxFreed);
                     return true;
-                });
+                };
+                auto afterCollect = [&](const GCResults & completedResults) noexcept {
+                    if (!didCollect || !cacheIdentity || !cachePath)
+                        return;
+                    if (completedResults.bytesFreed == 0 && completedResults.paths.empty()) {
+                        try {
+                            detail::EmptyAutoGCCacheRecord record{
+                                .completedAt = wallClockSeconds(),
+                                .freeAfter = getAvail(),
+                                .identity = *cacheIdentity,
+                            };
+                            if (!writeAutoGCCache(*cachePath, record))
+                                logDiagnostic("cache-write-error", [] { return "stage=write-empty-result"; });
+                        } catch (...) {
+                            logDiagnostic("cache-write-error", [] { return "stage=read-free-after"; });
+                        }
+                    } else {
+                        removeAutoGCCache(*cachePath);
+                    }
+                };
+
+                collectGarbageImpl(options, results, shouldCollect, afterCollect);
 
                 auto freeAfter = getAvail();
                 _state->lock()->availAfterGC = freeAfter;
                 if (diagnosticEnabled) {
                     auto completedAt = std::chrono::steady_clock::now();
-                    logDiagnostic(shouldCollect ? "completed" : "skipped", [&] {
+                    logDiagnostic(didCollect ? "completed" : "skipped", [&] {
                         return "request_ms=" + std::to_string(elapsedMs(requestStarted, completedAt))
                             + " queue_ms="
                             + (lockAcquiredAt ? std::to_string(elapsedMs(queuedAt, *lockAcquiredAt)) : "n/a")
@@ -1011,7 +1223,10 @@ void LocalStore::autoGC(bool sync)
                             + " free_at_lock=" + (freeAtLock ? std::to_string(*freeAtLock) : "n/a")
                             + " free_after=" + std::to_string(freeAfter)
                             + " bytes_freed=" + std::to_string(results.bytesFreed)
-                            + " paths=" + std::to_string(results.paths.size());
+                            + " paths=" + std::to_string(results.paths.size())
+                            + (didCollect ? "" : " skip_reason=" + std::string(skipReason))
+                            + (cacheAge ? " cache_age_s=" + std::to_string(*cacheAge) : "")
+                            + (cacheFreeAfter ? " cache_free_after=" + std::to_string(*cacheFreeAfter) : "");
                     });
                 }
 
